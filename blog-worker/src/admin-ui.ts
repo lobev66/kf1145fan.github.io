@@ -2401,7 +2401,7 @@ async function onFileClick(e){
   const li=btn.closest('li'); if(!li) return;
   const path=li.dataset.path, name=li.dataset.name, a=btn.dataset.a;
   if(a==='zip'){
-    if(!confirm('解压「'+name+'」到当前目录？\n小于 50MB 直接解压，大于 50MB 会触发 GitHub 工作流异步解压。')) return;
+    if(!confirm('解压「'+name+'」到当前目录？\\n小于 50MB 直接解压，大于 50MB 会触发 GitHub 工作流异步解压。')) return;
     const btn0=btn.textContent; btn.disabled=true; btn.textContent='解压中...';
     const r=await api(API_BASE+'/unzip-path',{method:'POST',body:JSON.stringify({path,branch:curBranch()})});
     btn.disabled=false; btn.textContent=btn0;
