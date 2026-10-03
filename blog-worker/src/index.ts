@@ -989,6 +989,9 @@ const AI_TOOLS = [
   { type: "function", function: { name: "send_email", description: "使用已配置的 SMTP 发送邮件。默认发送单封给 to；若 broadcast=true 则群发给全部「已确认」的订阅者（忽略 to）。主题/正文必填，正文支持 HTML，可用 {{site}} {{email}} {{unsubscribe}} 变量。", parameters: { type: "object", properties: { to: { type: "string", description: "收件邮箱（发单封时必填）" }, subject: { type: "string" }, body: { type: "string", description: "正文，支持 HTML" }, broadcast: { type: "boolean", description: "true 时群发给全部已确认订阅者" } }, required: ["subject", "body"] } } },
   { type: "function", function: { name: "http_get", description: "发起一个 HTTP GET 请求并返回状态码、响应头与响应体（用于抓取网页、调用 REST API）。", parameters: { type: "object", properties: { url: { type: "string", description: "完整 URL，必须以 http:// 或 https:// 开头" }, headers: { type: "object", description: "可选请求头键值对，如 {\"Accept\":\"application/json\"}" } }, required: ["url"] } } },
   { type: "function", function: { name: "http_post", description: "发起一个 HTTP POST 请求并返回状态码、响应头与响应体（用于提交表单、调用需要写入的 REST API）。", parameters: { type: "object", properties: { url: { type: "string", description: "完整 URL，必须以 http:// 或 https:// 开头" }, body: { type: "string", description: "请求体文本（如 JSON 字符串）" }, contentType: { type: "string", description: "请求体类型，如 application/json、application/x-www-form-urlencoded；默认 text/plain" }, headers: { type: "object", description: "可选请求头键值对" } }, required: ["url"] } } },
+  { type: "function", function: { name: "download_file", description: "从网络下载一个文件并保存到博客仓库（exe/图片/zip/压缩包等二进制均可）。url 也可传 GitHub 仓库的 owner/repo 或 https://github.com/owner/repo 链接，会自动下载该仓库源码 zip。path 为仓库内目标路径：以 / 结尾或省略表示目录（自动使用下载文件名），否则视为完整文件路径。上限约 45MB。", parameters: { type: "object", properties: { url: { type: "string", description: "http(s) 下载地址，或 GitHub 仓库 owner/repo" }, path: { type: "string", description: "仓库内目标路径或目录（目录以 / 结尾），可省略" }, name: { type: "string", description: "可选：保存的文件名" }, branch: { type: "string", description: "可选：分支，默认当前分支" } }, required: ["url"] } } },
+  { type: "function", function: { name: "unzip_file", description: "解压仓库内已有的 zip 文件到它所在目录：小于 50MB 由 Cloudflare 即时解压；大于 50MB 自动触发 GitHub 工作流异步解压。", parameters: { type: "object", properties: { path: { type: "string", description: "zip 文件在仓库中的完整路径" }, branch: { type: "string", description: "可选：分支" } }, required: ["path"] } } },
+  { type: "function", function: { name: "unzip_status", description: "查询大文件解压工作流（unzip.yml）的运行状态与最近结果。", parameters: { type: "object", properties: {} } } },
 ];
 
 // set_setting 允许修改的设置项（站点功能走 wl_Settings，其余写入订阅/SMTP 配置）
@@ -1000,7 +1003,7 @@ const AI_SETTING_KEYS = [
 ];
 
 // 危险工具：需要「重要确认」及以上权限时需用户确认
-const AI_DANGER_TOOLS = ["write_file", "delete_file", "trigger_build", "set_setting", "save_secret", "send_email", "http_post"];
+const AI_DANGER_TOOLS = ["write_file", "delete_file", "trigger_build", "set_setting", "save_secret", "send_email", "http_post", "download_file", "unzip_file"];
 
 // 生成工具使用说明（含可用密钥占位符名称，绝不含密钥值）
 async function aiToolsHint(db: D1Database): Promise<string> {
@@ -1015,6 +1018,7 @@ async function aiToolsHint(db: D1Database): Promise<string> {
     "可用 set_setting 修改的设置项 key：" + AI_SETTING_KEYS.join("、") + "。",
     "发邮件：用 send_email 发单封（to）或 broadcast=true 群发给已确认订阅者；需先在设置里配置 SMTP。发送前可先用 get_settings 确认 smtp.host 与 hasPass。",
     "联网：用 http_get 抓取网页或调用 GET 类接口，用 http_post 提交数据或调用写入类接口（需 http(s):// 开头，可自定义 headers/contentType）。响应体会自动截断，超长内容请分页或改用接口的查询参数。",
+    "下载与解压：用 download_file 把网络上的文件（含 GitHub 仓库 owner/repo 源码 zip）保存进仓库；用 unzip_file 解压仓库里的 zip（<50MB 即时完成，>50MB 触发 GitHub 工作流异步解压，可用 unzip_status 查看进度）。",
     names.length
       ? "当前可用的密钥占位符：" + names.map((n) => "{" + n + "}").join("、")
       : "当前没有配置任何密钥占位符（管理员可在「设置 → AI 密钥」中添加）。",
@@ -1205,6 +1209,19 @@ async function aiRunTool(env: Bindings, name: string, args: Record<string, unkno
         aiSecretHeaders(args.headers, secrets),
         s("contentType")
       );
+    case "download_file":
+      return jr(
+        await handleDownloadFile(env, {
+          url: applySecrets(s("url"), secrets),
+          path: s("path"),
+          name: s("name"),
+          branch: s("branch"),
+        })
+      );
+    case "unzip_file":
+      return jr(await handleUnzipByPath(env, { path: s("path"), branch: s("branch") }));
+    case "unzip_status":
+      return jr(await handleUnzipStatus(env));
     default:
       return JSON.stringify({ ok: false, error: "未知工具：" + name });
   }
@@ -1945,6 +1962,18 @@ app.post("/admin/api/unzip", async (c) => {
 app.post("/admin/api/unzip-path", async (c) => {
   if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
   return handleUnzipByPath(c.env as Bindings, await c.req.json());
+});
+
+// 从网络下载文件保存进仓库
+app.post("/admin/api/download", async (c) => {
+  if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
+  return handleDownloadFile(c.env as Bindings, await c.req.json().catch(() => ({})));
+});
+
+// 大文件解压工作流状态
+app.get("/admin/api/unzip-status", async (c) => {
+  if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
+  return handleUnzipStatus(c.env as Bindings);
 });
 
 // ---------- 5. /admin 统一管理后台（独立页面：管理文章 / 写作 / 评论 / 文件）----------
@@ -2760,32 +2789,75 @@ async function handleUnzipFile(env: Bindings, req: Request): Promise<Response> {
   }
 }
 
+// 小于该大小：Cloudflare 直接解压；超过：交给 GitHub Actions 工作流
+const UNZIP_INLINE_LIMIT = 50 * 1024 * 1024;
+// 从网络下载并写进仓库的单个文件上限（受 Worker 内存与 base64 开销限制）
+const DOWNLOAD_MAX_BYTES = 45 * 1024 * 1024;
+
+// 触发 GitHub 解压工作流（大文件走这里）
+async function triggerUnzipWorkflow(env: Bindings, zipPath: string, branch: string, dir: string): Promise<Response> {
+  const { token, repo, headers } = ghConfig(env);
+  if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${repo}/actions/workflows/unzip.yml/dispatches`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          ref: branch,
+          inputs: { zip_path: zipPath, branch, target_dir: dir || "", delete_zip: "true" },
+        }),
+      },
+    );
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      return json({ ok: false, error: "触发解压工作流失败 github error " + res.status, detail }, 502);
+    }
+    return json({
+      ok: true,
+      workflow: true,
+      running: true,
+      message: "文件较大，已触发 GitHub 解压工作流，正在解压（10 秒左右完成）",
+    });
+  } catch (e) {
+    return json({ ok: false, error: String(e) }, 500);
+  }
+}
+
 // 解压仓库内的已在目录里的 zip 文件到当前目录（不要求再上传）
+// <50MB 由 Cloudflare 即时解压；>50MB 触发 GitHub 工作流异步解压
 async function handleUnzipByPath(env: Bindings, body: any): Promise<Response> {
   const { token, repo, headers } = ghConfig(env);
   const useBranch = String(body.branch || "").trim() || ghConfig(env).branch;
   const zipPath = String(body.path || "").trim();
   if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
   if (!zipPath) return json({ ok: false, error: "path required" }, 400);
+  // 目标目录 = zip 所在目录
+  const dir = zipPath.split("/").filter(Boolean).slice(0, -1).join("/");
   try {
-    // 1) 读取 zip 原始字节
-    const dRes = await fetch(`https://api.github.com/repos/${repo}/contents/${ghPath(zipPath)}?ref=${encodeURIComponent(useBranch)}`, { headers });
-    if (!dRes.ok) return json({ ok: false, error: "读取 zip 失败 " + dRes.status }, 502);
-    const meta = (await dRes.json()) as any;
+    // 1) 读取 zip 文件元信息（拿到大小，决定解压方式）
+    const apiUrl = `https://api.github.com/repos/${repo}/contents/${ghPath(zipPath)}?ref=${encodeURIComponent(useBranch)}`;
+    const metaRes = await fetch(apiUrl, { headers });
+    if (!metaRes.ok) return json({ ok: false, error: "读取 zip 失败 " + metaRes.status }, 502);
+    const meta = (await metaRes.json()) as any;
     if (meta.type !== "file") return json({ ok: false, error: "不是文件" }, 400);
-    const base64 = meta.content.replace(/\s/g, "");
-    const bin = atob(base64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    // 2) 解压
+    const size = Number(meta.size || 0);
+    // 2) 大文件：触发 GitHub 工作流
+    if (size > UNZIP_INLINE_LIMIT) {
+      return await triggerUnzipWorkflow(env, zipPath, useBranch, dir);
+    }
+    // 3) 小文件：Cloudflare 直接读取原始字节并解压
+    //    注意：>1MB 的文件 contents API 默认不返回 content，需用 raw accept 头取原始内容
+    const rawRes = await fetch(apiUrl, { headers: { ...headers, accept: "application/vnd.github.raw" } });
+    if (!rawRes.ok) return json({ ok: false, error: "下载 zip 失败 " + rawRes.status }, 502);
+    const bytes = new Uint8Array(await rawRes.arrayBuffer());
     let entries: Record<string, Uint8Array>;
     try {
       entries = unzipSync(bytes);
     } catch {
       return json({ ok: false, error: "zip 解析失败，请确认是有效的 zip 文件" }, 400);
     }
-    // 3) 目标目录 = zip 所在目录
-    const dir = zipPath.split("/").filter(Boolean).slice(0, -1).join("/");
     const saved: string[] = [];
     const failed: string[] = [];
     const names = Object.keys(entries || {}).filter((n) => n && !n.endsWith("/"));
@@ -2805,11 +2877,101 @@ async function handleUnzipByPath(env: Bindings, body: any): Promise<Response> {
       ok: true,
       saved,
       failed,
+      size,
       message: `解压完成：成功 ${saved.length} 个` + (failed.length ? `，失败 ${failed.length} 个（${failed.slice(0, 3).join("、")}）` : ""),
     });
   } catch (e) {
     return json({ ok: false, error: String(e) }, 500);
   }
+}
+
+// 大文件解压工作流运行状态
+async function handleUnzipStatus(env: Bindings): Promise<Response> {
+  const { token, repo, headers } = ghConfig(env);
+  if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${repo}/actions/workflows/unzip.yml/runs?per_page=5`,
+      { headers },
+    );
+    if (!res.ok) return json({ ok: false, error: "github error " + res.status }, 502);
+    const data = (await res.json()) as any;
+    const isActive = (s: string) => s === "in_progress" || s === "queued" || s === "pending" || s === "waiting";
+    const runs = ((data.workflow_runs || []) as any[]).map((r: any) => ({
+      id: r.id,
+      status: r.status,
+      conclusion: r.conclusion || "",
+      created_at: r.created_at || "",
+      html_url: r.html_url || "",
+    }));
+    const running = runs.some((r: any) => isActive(r.status));
+    return json({ ok: true, running, latest: runs[0] || null, runs });
+  } catch (e) {
+    return json({ ok: false, error: String(e) }, 500);
+  }
+}
+
+// 从网络下载文件并保存进仓库
+async function handleDownloadFile(env: Bindings, body: any): Promise<Response> {
+  const { token, repo, headers } = ghConfig(env);
+  const useBranch = String(body.branch || "").trim() || ghConfig(env).branch;
+  if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
+  let url = String(body.url || "").trim();
+  const target = String(body.path || "").trim();
+  if (!url) return json({ ok: false, error: "url required" }, 400);
+  try {
+    // GitHub 仓库 owner/repo 简写或仓库主页地址 → 转为源码 zip 下载地址
+    const gh = url.match(/^([\w.-]+)\/([\w.-]+)$/) || url.match(/^https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i);
+    if (gh) {
+      const owner = gh[1], name = gh[2];
+      let defBranch = "main";
+      const info = await fetch(`https://api.github.com/repos/${owner}/${name}`, { headers });
+      if (info.ok) defBranch = ((await info.json()) as any).default_branch || "main";
+      url = `https://codeload.github.com/${owner}/${name}/zip/refs/heads/${defBranch}`;
+    }
+    if (!/^https?:\/\//i.test(url)) return json({ ok: false, error: "url 必须以 http:// 或 https:// 开头" }, 400);
+    const res = await fetch(url, { redirect: "follow" });
+    if (!res.ok) return json({ ok: false, error: `下载失败 HTTP ${res.status}` }, 502);
+    const len = Number(res.headers.get("content-length") || 0);
+    if (len && len > DOWNLOAD_MAX_BYTES)
+      return json({ ok: false, error: `文件过大（${(len / 1048576).toFixed(1)}MB），超过 ${DOWNLOAD_MAX_BYTES / 1048576}MB 上限` }, 400);
+    const buf = new Uint8Array(await res.arrayBuffer());
+    if (!buf.length) return json({ ok: false, error: "下载内容为空" }, 400);
+    if (buf.length > DOWNLOAD_MAX_BYTES)
+      return json({ ok: false, error: `文件过大（${(buf.length / 1048576).toFixed(1)}MB），超过 ${DOWNLOAD_MAX_BYTES / 1048576}MB 上限` }, 400);
+    // 目标路径：以 / 结尾或省略视为目录，自动使用文件名；否则视为完整文件路径
+    const name = String(body.name || "").trim() || guessDownloadName(url, res.headers);
+    let full: string;
+    if (!target || /\/$/.test(target)) full = (target.replace(/\/+$/, "") ? target.replace(/\/+$/, "") + "/" : "") + name;
+    else full = target;
+    const rawApi = `https://api.github.com/repos/${repo}/contents/${ghPath(full)}`;
+    let sha: string | undefined;
+    const exist = await fetch(`${rawApi}?ref=${encodeURIComponent(useBranch)}`, { headers });
+    if (exist.ok) sha = ((await exist.json()) as any).sha;
+    const payload: any = { message: `docs: download ${full}`, content: bytesToBase64(buf), branch: useBranch };
+    if (sha) payload.sha = sha;
+    const put = await fetch(rawApi, { method: "PUT", headers, body: JSON.stringify(payload) });
+    const putData = await put.json().catch(() => ({}));
+    if (!put.ok) return json({ ok: false, error: "保存失败：" + ((putData as any).message || put.status) }, 502);
+    return json({ ok: true, path: full, size: buf.length, message: `已下载并保存到 ${full}（${(buf.length / 1024).toFixed(1)} KB）` });
+  } catch (e) {
+    return json({ ok: false, error: String(e) }, 500);
+  }
+}
+
+// 从响应头/URL 推断文件名
+function guessDownloadName(url: string, headers: Headers): string {
+  const cd = headers.get("content-disposition") || "";
+  const m = cd.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+  if (m) {
+    try { return decodeURIComponent(m[1].replace(/"/g, "").trim()); } catch { /* ignore */ }
+  }
+  try {
+    const u = new URL(url);
+    const seg = u.pathname.split("/").filter(Boolean).pop() || "";
+    if (seg) return decodeURIComponent(seg);
+  } catch { /* ignore */ }
+  return "download.bin";
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

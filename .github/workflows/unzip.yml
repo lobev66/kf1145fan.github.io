@@ -1,0 +1,69 @@
+name: 解压大文件
+
+# 由 Cloudflare Worker 在解压 >50MB 的 zip 时通过 API 触发（workflow_dispatch）。
+# 也可在 Actions 页面手动运行。
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "要解压的 zip 文件在仓库中的路径"
+        required: true
+        type: string
+      branch:
+        description: "分支"
+        required: false
+        default: "main"
+        type: string
+      target_dir:
+        description: "解压目标目录（留空则解压到 zip 所在目录）"
+        required: false
+        default: ""
+        type: string
+      delete_zip:
+        description: "解压后是否删除原 zip（true/false）"
+        required: false
+        default: "true"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: 解压并提交
+        env:
+          ZIP_PATH: ${{ inputs.zip_path }}
+          BRANCH: ${{ inputs.branch }}
+          TARGET_DIR: ${{ inputs.target_dir }}
+          DELETE_ZIP: ${{ inputs.delete_zip }}
+        run: |
+          set -e
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "找不到文件：$ZIP_PATH"
+            exit 1
+          fi
+          if [ -z "$TARGET_DIR" ]; then
+            TARGET_DIR="$(dirname "$ZIP_PATH")"
+          fi
+          case "$TARGET_DIR" in
+            .|./) TARGET_DIR="" ;;
+          esac
+          echo "解压 $ZIP_PATH -> ${TARGET_DIR:-<仓库根目录>}"
+          if [ -n "$TARGET_DIR" ]; then mkdir -p "$TARGET_DIR"; fi
+          unzip -o "$ZIP_PATH" -d "$TARGET_DIR"
+          if [ "$DELETE_ZIP" = "true" ]; then rm -f "$ZIP_PATH"; fi
+          git config user.name "unzip-bot"
+          git config user.email "unzip-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "没有需要提交的变更"
+            exit 0
+          fi
+          git commit -m "chore: unzip $ZIP_PATH"
+          git push origin "HEAD:$BRANCH"

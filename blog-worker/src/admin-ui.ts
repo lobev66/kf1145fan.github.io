@@ -381,7 +381,7 @@ function go(name){
     showPage(name);
     if(name==='manage'){ loadPosts(); initBuildStatus(); }
     if(name==='comments') loadComments();
-    if(name==='files') loadFiles();
+    if(name==='files'){ loadFiles(); resumeUnzipStatus(); }
     if(name==='build') loadBuildHistory();
     if(name==='visit') loadVisit();
     if(name==='subscribe') loadSubscribe();
@@ -2401,9 +2401,16 @@ async function onFileClick(e){
   const li=btn.closest('li'); if(!li) return;
   const path=li.dataset.path, name=li.dataset.name, a=btn.dataset.a;
   if(a==='zip'){
-    if(!confirm('解压「'+name+'」到当前目录？')) return;
+    if(!confirm('解压「'+name+'」到当前目录？\n小于 50MB 直接解压，大于 50MB 会触发 GitHub 工作流异步解压。')) return;
+    const btn0=btn.textContent; btn.disabled=true; btn.textContent='解压中...';
     const r=await api(API_BASE+'/unzip-path',{method:'POST',body:JSON.stringify({path,branch:curBranch()})});
+    btn.disabled=false; btn.textContent=btn0;
     if(r.status===401){ redirectLogin(); return; }
+    if(r.ok&&r.data&&r.data.workflow){
+      toast(r.data.message||'已触发解压工作流，正在解压...');
+      startUnzipPoll();
+      return;
+    }
     if(r.ok&&r.data&&r.data.ok) toast(r.data.message||'解压完成');
     else toast('解压失败：'+(r.data&&r.data.error||r.status),true);
     loadFiles();
@@ -2497,6 +2504,66 @@ function newFolder(){
     if(res.ok&&res.data&&res.data.ok){ toast('已创建 '+name.trim()); loadFiles(); }
     else toast('创建失败',true);
   });
+}
+// ---------- 文件管理：从网络下载 / 大文件解压状态 ----------
+async function downloadFromUrl(){
+  const url=prompt('输入要下载的文件地址（http/https，或 GitHub 仓库 owner/repo）：');
+  if(!url||!url.trim()) return;
+  const suggest=url.trim().split(/[?#]/)[0].split('/').filter(Boolean).pop()||'';
+  const name=prompt('保存的文件名（可修改，留空自动识别）：', /\.[a-z0-9]{2,5}$/i.test(suggest)?suggest:'');
+  const dir=filePath?filePath+'/':'';
+  toast('正在下载...');
+  const r=await api(API_BASE+'/download',{method:'POST',body:JSON.stringify({url:url.trim(),name:(name||'').trim(),path:dir,branch:curBranch()})});
+  if(r.status===401){ redirectLogin(); return; }
+  if(r.ok&&r.data&&r.data.ok){ toast(r.data.message||'下载完成'); loadFiles(); }
+  else toast('下载失败：'+(r.data&&r.data.error||r.status),true);
+}
+let unzipTimer=null, unzipSeen=false, unzipTries=0;
+const UNZIP_DOT='<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);animation:aiWaitPulse 1s infinite;margin-right:6px"></span>';
+function renderUnzipStatus(info){
+  const el=$('#unzipStatus'); if(!el) return;
+  if(!info){ el.classList.add('hidden'); el.innerHTML=''; return; }
+  el.classList.remove('hidden');
+  if(info.running){
+    el.innerHTML=UNZIP_DOT+'<span>正在运行解压工作流…（大文件解压，约 10 秒完成）</span>';
+  }else{
+    const okc=info.conclusion==='success';
+    el.innerHTML='解压工作流已结束：'+(okc?'✅ 成功':'⚠️ '+(info.conclusion||'未知'))+
+      (info.html_url?' <a href="'+info.html_url+'" target="_blank" style="color:var(--accent)">查看日志</a>':'');
+    setTimeout(()=>{ const e2=$('#unzipStatus'); if(e2){ e2.classList.add('hidden'); e2.innerHTML=''; } },6000);
+  }
+}
+async function checkUnzipStatus(){
+  const r=await api(API_BASE+'/unzip-status');
+  if(r.status===401){ redirectLogin(); return null; }
+  if(!r.ok||!r.data||!r.data.ok) return null;
+  return r.data;
+}
+function stopUnzipPoll(){ if(unzipTimer){ clearInterval(unzipTimer); unzipTimer=null; } }
+async function unzipPollTick(){
+  unzipTries++;
+  const d=await checkUnzipStatus();
+  if(!d){ if(unzipTries>=8){ stopUnzipPoll(); renderUnzipStatus(null); } return; }
+  if(d.running){ unzipSeen=true; renderUnzipStatus({running:true}); return; }
+  // GitHub 记录 run 有几秒延迟：没观察到 running 前先多等几轮
+  if(!unzipSeen && unzipTries<8) return;
+  stopUnzipPoll();
+  const latest=d.latest||{};
+  renderUnzipStatus({running:false,conclusion:latest.conclusion,html_url:latest.html_url});
+  loadFiles();
+}
+function startUnzipPoll(){
+  if(unzipTimer) return;
+  unzipSeen=false; unzipTries=0;
+  renderUnzipStatus({running:true});
+  unzipTimer=setInterval(unzipPollTick,2500);
+  unzipPollTick();
+}
+// 进入文件页时：若后台仍有解压工作流在跑，恢复「正在运行」提示
+async function resumeUnzipStatus(){
+  if(unzipTimer) return;
+  const d=await checkUnzipStatus();
+  if(d&&d.running) startUnzipPoll();
 }
 
 // ---------- 写作页草稿自动保存（刷新后恢复，参考 cp.802213.xyz）----------
@@ -2627,6 +2694,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   $('#upBtn').onclick=()=>$('#upInput').click();
   $('#upInput').onchange=e=>{ doUpload(Array.from(e.target.files||[])); e.target.value=''; };
   $('#upDirBtn').onclick=upLevel;
+  $('#dlUrlBtn').onclick=downloadFromUrl;
   $('#branchSel').onchange=e=>{ fileBranch=e.target.value||'main'; filePath=''; loadFiles(); };
   $('#newFolderBtn').onclick=newFolder;
   // 文件管理：多选 / 回收站
@@ -2684,7 +2752,7 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
   </div>
 </nav>
 
-<div class="wk-tabs" ${INITIAL === "write" ? 'style="display:none"' : ""}>
+<div class="wk-tabs">
   <button class="wk-tab ${INITIAL === "manage" ? "active" : ""}" data-tab="manage">管理文章</button>
   <button class="wk-tab ${INITIAL === "comments" ? "active" : ""}" data-tab="comments">评论管理</button>
   <button class="wk-tab ${INITIAL === "files" ? "active" : ""}" data-tab="files">文件管理</button>
@@ -2723,11 +2791,12 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
   <!-- 写作页 -->
   <div id="page-write" class="${pageCls("write")}">
     <div class="wk-card">
-      <div class="toolbar" style="justify-content:space-between;align-items:center">
-        <h3 class="wk-title" style="margin:0;border:none;padding:0" id="editorTitle">发布新文章</h3>
-        <div style="display:flex;gap:6px">
+      <div class="toolbar" style="justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:8px;min-width:0">
           <button class="wk-btn ghost sm" onclick="go('manage')">← 返回管理文章</button>
+          <h3 class="wk-title" style="margin:0;border:none;padding:0" id="editorTitle">发布新文章</h3>
         </div>
+        <button class="wk-btn" id="saveBtn">发布文章</button>
       </div>
       <label class="wk-label">标题</label>
       <input class="wk-input" id="title" placeholder="文章标题">
@@ -2740,9 +2809,6 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
       <datalist id="tagList"></datalist>
       <label class="wk-label">正文（Markdown，分屏预览）</label>
       <div id="edt"></div>
-      <div class="toolbar" style="justify-content:flex-end;margin-top:12px">
-        <button class="wk-btn" id="saveBtn">发布文章</button>
-      </div>
       <div class="msg" id="msg" style="margin-top:8px"></div>
     </div>
   </div>
@@ -2776,12 +2842,14 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
         <div class="filters" id="fileOps">
           <button class="wk-btn ghost sm" id="upDirBtn" title="返回上一级">← 上一级</button>
           <button class="wk-btn sm" id="upBtn">上传</button>
+          <button class="wk-btn ghost sm" id="dlUrlBtn" title="从网络下载文件保存到当前目录">从网络下载</button>
           <button class="wk-btn ghost sm" id="newFolderBtn">新建文件夹</button>
           <button class="wk-btn ghost sm" id="recycleBtn">回收站</button>
         </div>
         <input type="file" id="upInput" multiple style="display:none">
       </div>
       <div class="breadcrumb" id="fileCrumb" style="font-size:12px;color:var(--muted);padding:8px 6px 4px;word-break:break-all"></div>
+      <div id="unzipStatus" class="hidden" style="margin:0 0 8px;padding:8px 10px;border-radius:6px;font-size:13px;background:var(--input-bg);color:var(--fg);display:flex;align-items:center;gap:8px"></div>
       <div class="filters hidden" id="fileBatchBar" style="margin:0 0 8px">
         <label class="wk-label" style="display:flex;align-items:center;gap:6px;margin:0;cursor:pointer">
           <input type="checkbox" id="filePickAll" style="width:auto"> 全选
