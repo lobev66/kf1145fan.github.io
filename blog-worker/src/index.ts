@@ -1032,6 +1032,14 @@ const AI_TOOLS = [
   { type: "function", function: { name: "trigger_workflow", description: "触发运行指定的 GitHub 工作流。workflow_id 传工作流文件名（如 clone-repo.yml、deploy.yml）或工作流名称；可用 inputs 传 workflow_dispatch 的输入参数。", parameters: { type: "object", properties: { workflow_id: { type: "string", description: "工作流文件名（如 clone-repo.yml）或名称" }, ref: { type: "string", description: "可选：分支，默认当前分支" }, inputs: { type: "object", description: "可选：workflow_dispatch 输入参数键值对" } }, required: ["workflow_id"] } } },
   { type: "function", function: { name: "cancel_workflow", description: "取消正在运行的 GitHub 工作流。runId 可省略，默认取消最近一次仍在运行的工作流。", parameters: { type: "object", properties: { runId: { type: "string", description: "可选：要取消的 run id，省略则取消最近一次运行中的工作流" } } } } },
   { type: "function", function: { name: "clone_repo", description: "把一个外部 Git 仓库克隆到当前博客仓库的指定目录（例如克隆一个 Hexo 主题到 themes/xxx）。由 GitHub 工作流异步完成，约 10 秒。repo_url 支持 owner/repo 或完整 URL。", parameters: { type: "object", properties: { repo_url: { type: "string", description: "要克隆的仓库：owner/repo 或完整 URL" }, target_dir: { type: "string", description: "目标目录，如 themes/next" }, ref: { type: "string", description: "可选：源仓库的分支或标签" }, branch: { type: "string", description: "可选：提交到当前仓库的分支" } }, required: ["repo_url", "target_dir"] } } },
+  { type: "function", function: { name: "move_path", description: "移动或重命名仓库中的文件/目录（目录会整体移动，一次提交完成，可用于给主题/资源改名）。目标已存在时自动加序号避免覆盖。", parameters: { type: "object", properties: { from: { type: "string", description: "原路径" }, to: { type: "string", description: "新路径" }, branch: { type: "string", description: "可选：分支" } }, required: ["from", "to"] } } },
+  { type: "function", function: { name: "create_folder", description: "在仓库中新建一个文件夹（自动放入 .gitkeep 占位，空目录也能被 Git 保留）。", parameters: { type: "object", properties: { path: { type: "string", description: "文件夹路径，如 source/images" }, branch: { type: "string", description: "可选：分支" } }, required: ["path"] } } },
+  { type: "function", function: { name: "search_files", description: "在仓库中搜索：先按文件名匹配；content=true 时同时在文本文件内容里查找关键词（返回文件名与行号片段，受数量上限保护）。可用 dir 限定目录。", parameters: { type: "object", properties: { query: { type: "string", description: "关键词" }, dir: { type: "string", description: "可选：限定目录，如 source/_posts" }, content: { type: "boolean", description: "是否搜索文件内容，默认 false 只搜文件名" }, branch: { type: "string", description: "可选：分支" } }, required: ["query"] } } },
+  { type: "function", function: { name: "compare_branches", description: "对比两个分支的差异（提交列表与变更文件），用于排查某分支改了什么。", parameters: { type: "object", properties: { base: { type: "string", description: "基准分支，如 main" }, head: { type: "string", description: "待比较分支" } }, required: ["base", "head"] } } },
+  { type: "function", function: { name: "repo_config", description: "一次性读取仓库关键配置文件（_config.yml、wrangler.toml、package.json 等）并列出所有 GitHub 工作流文件，用于部署/构建排错。可用 paths 指定要读的文件。", parameters: { type: "object", properties: { paths: { type: "string", description: "可选：要读取的文件路径，逗号或空格分隔；省略则读默认关键配置" }, branch: { type: "string", description: "可选：分支" } } } } },
+  { type: "function", function: { name: "cloudflare_api", description: "调用 Cloudflare API（需先在「设置 → AI 密钥」保存名为 CF_API_TOKEN 的密钥）。path 为 API v4 路径，例如 /zones、/accounts、/accounts/{account_id}/workers/routes、/zones/{zone_id}/dns_records。用于查看/新增 Worker 路由、DNS 记录、绑定域名等。可先调 /accounts、/zones 获取 id。", parameters: { type: "object", properties: { method: { type: "string", description: "GET/POST/PUT/PATCH/DELETE，默认 GET" }, path: { type: "string", description: "API v4 路径，如 /zones" }, body: { type: "string", description: "可选：POST/PUT/PATCH 的 JSON 请求体" } }, required: ["path"] } } },
+  { type: "function", function: { name: "http_request", description: "发起任意方法的 HTTP 请求（GET/POST/PUT/PATCH/DELETE/HEAD），返回状态码、响应头与响应体（超长自动截断）。需要其它方法或自定义请求体时用它。", parameters: { type: "object", properties: { method: { type: "string", description: "请求方法" }, url: { type: "string", description: "完整 URL" }, body: { type: "string", description: "可选：请求体文本" }, contentType: { type: "string", description: "可选：如 application/json" }, headers: { type: "object", description: "可选：请求头键值对" } }, required: ["method", "url"] } } },
+  { type: "function", function: { name: "fetch_text", description: "抓取网页并提取可读正文（自动去掉 HTML 标签/脚本/样式），适合阅读文章、文档或抓取正文内容。", parameters: { type: "object", properties: { url: { type: "string", description: "完整 URL" }, maxChars: { type: "integer", description: "可选：返回正文的最大字符数，默认 40000" } }, required: ["url"] } } },
 ];
 
 // set_setting 允许修改的设置项（站点功能走 wl_Settings，其余写入订阅/SMTP 配置）
@@ -1043,7 +1051,7 @@ const AI_SETTING_KEYS = [
 ];
 
 // 危险工具：需要「重要确认」及以上权限时需用户确认
-const AI_DANGER_TOOLS = ["write_file", "delete_file", "trigger_build", "set_setting", "save_secret", "send_email", "http_post", "download_file", "unzip_file", "trigger_workflow", "cancel_workflow", "clone_repo"];
+const AI_DANGER_TOOLS = ["write_file", "delete_file", "trigger_build", "set_setting", "save_secret", "send_email", "http_post", "download_file", "unzip_file", "trigger_workflow", "cancel_workflow", "clone_repo", "move_path", "create_folder", "cloudflare_api", "http_request"];
 
 // 生成工具使用说明（含可用密钥占位符名称，绝不含密钥值）
 async function aiToolsHint(db: D1Database): Promise<string> {
@@ -1062,6 +1070,10 @@ async function aiToolsHint(db: D1Database): Promise<string> {
     "部署排错：用 build_status 查看部署状态；用 get_build_logs 拉取部署工作流日志文本（可传 runId，省略则取最近一次），用于分析构建失败原因。",
     "工作流控制：用 list_workflows 查看仓库里有哪些工作流；用 workflow_runs 查看运行记录（可传 workflow 文件名）；用 trigger_workflow 运行指定的工作流（workflow_id 传文件名如 deploy.yml，可带 inputs）；用 cancel_workflow 停止当前正在运行的工作流（可传 runId，省略则取消最近一次运行中的）。",
     "克隆仓库：用 clone_repo 把外部仓库（如一个 Hexo 主题）克隆到当前仓库的指定目录，例如 repo_url=theme-next/hexo-theme-next, target_dir=themes/next；由 GitHub 工作流异步完成。",
+    "文件管理增强：用 move_path 移动或重命名文件/目录（目录整体一次提交）；用 create_folder 新建文件夹（自带 .gitkeep 占位）；用 search_files 按文件名或内容搜索仓库（content=true 搜内容）。",
+    "部署排错增强：用 compare_branches 对比两个分支的差异（提交与变更文件）；用 repo_config 一次读取关键配置文件（_config.yml、wrangler.toml 等）并列出所有工作流文件。",
+    "Cloudflare 运维：用 cloudflare_api 调用 Cloudflare API v4（需先在「设置 → AI 密钥」保存 CF_API_TOKEN），管理 Worker 路由、DNS 记录、绑定域名等，例如先 path=/zones 或 /accounts 获取 id。",
+    "联网增强：用 http_request 发起任意方法（PUT/PATCH/DELETE/HEAD）的请求；用 fetch_text 抓取网页并自动提取可读正文（去标签），适合阅读文章或文档。",
     names.length
       ? "当前可用的密钥占位符：" + names.map((n) => "{" + n + "}").join("、")
       : "当前没有配置任何密钥占位符（管理员可在「设置 → AI 密钥」中添加）。",
@@ -1095,14 +1107,195 @@ async function aiHttpRequest(
     }
     const hasCT = Object.keys(h).some((k) => k.toLowerCase() === "content-type");
     if (method === "POST" && contentType && !hasCT) h["Content-Type"] = contentType;
+    const m = String(method || "GET").toUpperCase();
+    if (["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"].indexOf(m) < 0)
+      return JSON.stringify({ ok: false, error: "不支持的 method：" + method });
+    const hasBody = m !== "GET" && m !== "HEAD";
+    if (hasBody && contentType && !hasCT) h["Content-Type"] = contentType;
     const t0 = Date.now();
-    const r = await fetch(url, { method, headers: h, body: method === "POST" ? body || "" : undefined, redirect: "follow" });
+    const r = await fetch(url, { method: m, headers: h, body: hasBody ? (body || "") : undefined, redirect: "follow" });
     const ms = Date.now() - t0;
     const text = await r.text().catch(() => "");
     const out = text.length > 100000 ? text.slice(0, 100000) + "\n...(内容过长已截断)" : text;
     const rh: Record<string, string> = {};
     r.headers.forEach((v, k) => { rh[k] = v; });
     return JSON.stringify({ ok: r.ok, status: r.status, ms, headers: rh, body: out });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+}
+
+// 从已保存的密钥中取真实值（仅服务端使用，绝不返回给 AI）
+function secretValue(secrets: SecretRow[], names: string[]): string {
+  for (const n of names) {
+    const hit = secrets.find((s) => s.name === n);
+    if (hit && hit.value) return hit.value;
+  }
+  return "";
+}
+
+// 抓取网页并提取可读正文（去掉脚本/样式/HTML 标签）
+function aiHtmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<\/(p|div|li|tr|h[1-6]|section|article|header|footer)>/gi, "\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/\n\s*\n\s*\n+/g, "\n\n")
+    .trim();
+}
+async function aiFetchText(url: string, maxChars: number): Promise<string> {
+  try {
+    if (!/^https?:\/\//i.test(url)) return JSON.stringify({ ok: false, error: "url 必须以 http:// 或 https:// 开头" });
+    const r = await fetch(url, {
+      redirect: "follow",
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; BlogAdminAI/1.0)", Accept: "text/html,application/xhtml+xml,text/plain,*/*" },
+    });
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    const raw = await r.text().catch(() => "");
+    const isHtml = ct.indexOf("html") >= 0 || /<html|<!doctype html|<body/i.test(raw.slice(0, 800));
+    const text = isHtml ? aiHtmlToText(raw) : raw;
+    const cap = Math.max(2000, Math.min(Number(maxChars) || 40000, 200000));
+    return JSON.stringify({
+      ok: r.ok,
+      status: r.status,
+      content_type: ct,
+      truncated: text.length > cap,
+      text: text.length > cap ? text.slice(0, cap) + "\n...(已截断)" : text,
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+}
+
+// 搜索仓库文件：先按文件名匹配；content=true 时再在文本文件内容里查找（受数量上限保护）
+const AI_BINARY_EXT = ["png","jpg","jpeg","gif","webp","bmp","ico","svgz","pdf","zip","gz","tgz","rar","7z","exe","dll","so","dylib","woff","woff2","ttf","otf","eot","mp3","mp4","mov","avi","webm","psd","class","jar","wasm","bin","dat"];
+async function handleSearchFiles(env: Bindings, query: string, dir: string, searchContent: boolean, branch?: string): Promise<string> {
+  const q = String(query || "").trim();
+  if (!q) return JSON.stringify({ ok: false, error: "query 不能为空" });
+  const useBranch = branch || ghConfig(env).branch;
+  const info = await ghTreeInfo(env, useBranch);
+  if (!info.ok) return JSON.stringify({ ok: false, error: info.error });
+  const { repo, headers } = ghConfig(env);
+  const norm = String(dir || "").replace(/^\/+|\/+$/g, "");
+  const under = (info.tree || []).filter(
+    (e: any) => e && e.type === "blob" && (!norm || e.path === norm || String(e.path).startsWith(norm + "/")),
+  );
+  const ql = q.toLowerCase();
+  const out: any = {
+    ok: true,
+    query: q,
+    dir: norm || "/",
+    name_matches: under.filter((e: any) => String(e.path).toLowerCase().indexOf(ql) >= 0).map((e: any) => e.path).slice(0, 100),
+    content_matches: [],
+    scanned: 0,
+  };
+  if (!searchContent) return JSON.stringify(out);
+  const isText = (p: string) => AI_BINARY_EXT.indexOf((p.split(".").pop() || "").toLowerCase()) < 0;
+  const cands = under.filter((e: any) => isText(e.path) && (!e.size || e.size <= 200000)).slice(0, 25);
+  out.scanned = cands.length;
+  for (const e of cands) {
+    try {
+      const r = await fetch(`https://api.github.com/repos/${repo}/git/blobs/${e.sha}`, { headers });
+      if (!r.ok) continue;
+      const b = (await r.json()) as any;
+      if (!b || b.encoding !== "base64" || typeof b.content !== "string") continue;
+      const bin = atob(b.content.replace(/\s+/g, ""));
+      const text = new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+      const lines = text.split("\n");
+      const hits: any[] = [];
+      for (let i = 0; i < lines.length && hits.length < 5; i++) {
+        if (lines[i].toLowerCase().indexOf(ql) >= 0) hits.push({ n: i + 1, text: lines[i].slice(0, 300) });
+      }
+      if (hits.length) out.content_matches.push({ path: e.path, lines: hits });
+      if (out.content_matches.length >= 20) break;
+    } catch {}
+  }
+  return JSON.stringify(out);
+}
+
+// 对比两个分支的差异（提交与变更文件），用于排查某分支改了什么
+async function handleCompareBranches(env: Bindings, base: string, head: string): Promise<string> {
+  const { token, repo, headers } = ghConfig(env);
+  if (!token) return JSON.stringify({ ok: false, error: "GH_TOKEN not configured" });
+  const b = String(base || "").replace(/^\/+|\/+$/g, "");
+  const h = String(head || "").replace(/^\/+|\/+$/g, "");
+  if (!b || !h) return JSON.stringify({ ok: false, error: "base 与 head 必填" });
+  try {
+    const r = await fetch(`https://api.github.com/repos/${repo}/compare/${ghRefPath(b)}...${ghRefPath(h)}`, { headers });
+    const d = (await r.json().catch(() => ({}))) as any;
+    if (!r.ok) return JSON.stringify({ ok: false, error: d?.message || "HTTP " + r.status });
+    return JSON.stringify({
+      ok: true,
+      status: d.status,
+      ahead_by: d.ahead_by,
+      behind_by: d.behind_by,
+      total_commits: d.total_commits,
+      commits: (d.commits || []).slice(-30).map((c: any) => ({ sha: String(c.sha).slice(0, 8), message: String(c.commit?.message || "").split("\n")[0] })),
+      files: (d.files || []).slice(0, 100).map((f: any) => ({ path: f.filename, status: f.status, changes: f.changes })),
+      files_truncated: (d.files || []).length > 100,
+    });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e) });
+  }
+}
+
+// 一次性读取仓库关键配置文件 + 列出所有工作流文件（部署排错用）
+const AI_COMMON_CONFIG = ["_config.yml", "_config.next.yml", "wrangler.toml", "package.json", "netlify.toml", "vercel.json", "blog-worker/wrangler.toml", "blog-worker/package.json"];
+async function handleRepoConfig(env: Bindings, pathsArg: string, branch?: string): Promise<string> {
+  const useBranch = branch || ghConfig(env).branch;
+  const info = await ghTreeInfo(env, useBranch);
+  if (!info.ok) return JSON.stringify({ ok: false, error: info.error });
+  const all = info.tree || [];
+  const workflows = all
+    .filter((e: any) => e.type === "blob" && /^\.github\/workflows\/.+\.ya?ml$/i.test(e.path))
+    .map((e: any) => e.path);
+  const exist = new Set(all.map((e: any) => e.path));
+  const wanted = String(pathsArg || "").split(/[,\s]+/).map((x) => x.trim()).filter(Boolean);
+  const list = (wanted.length ? wanted : AI_COMMON_CONFIG).filter((p) => exist.has(p));
+  const files: any[] = [];
+  for (const p of list.slice(0, 12)) {
+    const r = await handleGetFile(env, p, useBranch);
+    const d = (await r.json().catch(() => ({}))) as any;
+    if (d && typeof d.content === "string")
+      files.push({ path: p, content: d.content.length > 20000 ? d.content.slice(0, 20000) + "\n...(已截断)" : d.content });
+  }
+  return JSON.stringify({ ok: true, branch: useBranch, workflows, files, note: "如需读取其它文件，用 read_file" });
+}
+
+// 调用 Cloudflare API（使用已保存的 CF_API_TOKEN，仅服务端可见）
+async function handleCloudflareApi(secrets: SecretRow[], method: string, path: string, body: string): Promise<string> {
+  const token = secretValue(secrets, ["CF_API_TOKEN", "CLOUDFLARE_API_TOKEN", "CF_TOKEN"]);
+  if (!token)
+    return JSON.stringify({
+      ok: false,
+      error: "未配置 Cloudflare API Token。请在「设置 → AI 密钥」保存名为 CF_API_TOKEN 的密钥（需 Workers Routes / DNS 编辑权限）",
+    });
+  const m = String(method || "GET").toUpperCase();
+  if (["GET", "POST", "PUT", "PATCH", "DELETE"].indexOf(m) < 0) return JSON.stringify({ ok: false, error: "不支持的 method：" + m });
+  let p = String(path || "").trim();
+  if (!p) return JSON.stringify({ ok: false, error: "path 不能为空，例如 /zones" });
+  if (/^https?:\/\//i.test(p)) {
+    const u = new URL(p);
+    p = u.pathname + u.search;
+  }
+  if (p.charAt(0) !== "/") p = "/" + p;
+  try {
+    const init: any = { method: m, headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" } };
+    if (m !== "GET" && m !== "DELETE" && body) init.body = applySecrets(body, secrets);
+    const r = await fetch("https://api.cloudflare.com/client/v4" + p, init);
+    const text = await r.text().catch(() => "");
+    const out = text.length > 60000 ? text.slice(0, 60000) + "\n...(已截断)" : text;
+    return JSON.stringify({ ok: r.ok, status: r.status, body: out });
   } catch (e) {
     return JSON.stringify({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
@@ -1289,6 +1482,31 @@ async function aiRunTool(env: Bindings, name: string, args: Record<string, unkno
           branch: s("branch"),
         })
       );
+    case "move_path":
+      return JSON.stringify(await movePath(env, s("from"), s("to"), s("branch") || ghConfig(env).branch));
+    case "create_folder": {
+      const p = s("path").replace(/^\/+|\/+$/g, "");
+      if (!p) return JSON.stringify({ ok: false, error: "path 不能为空" });
+      return jr(await handleSaveFile(env, { path: p + "/.gitkeep", content: "", branch: s("branch") }));
+    }
+    case "search_files":
+      return await handleSearchFiles(env, s("query"), s("dir"), s("content") === "true", s("branch"));
+    case "compare_branches":
+      return await handleCompareBranches(env, s("base"), s("head"));
+    case "repo_config":
+      return await handleRepoConfig(env, s("paths"), s("branch"));
+    case "cloudflare_api":
+      return await handleCloudflareApi(secrets, s("method"), s("path"), s("body"));
+    case "http_request":
+      return await aiHttpRequest(
+        s("method") || "GET",
+        applySecrets(s("url"), secrets),
+        applySecrets(s("body"), secrets),
+        aiSecretHeaders(args.headers, secrets),
+        s("contentType")
+      );
+    case "fetch_text":
+      return await aiFetchText(applySecrets(s("url"), secrets), Number(s("maxChars")) || 40000);
     default:
       return JSON.stringify({ ok: false, error: "未知工具：" + name });
   }

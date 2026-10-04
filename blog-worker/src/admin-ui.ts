@@ -930,6 +930,7 @@ function aiToggleFull(){
   const on = !el.classList.contains('ai-full');
   aiSetFull(on);
   try{ localStorage.setItem('aiFull', on ? '1' : '0'); }catch(e){}
+  aiStick = true; // 切换全屏：贴回底部
   scrollAiBottom();
 }
 // 手机端：把聊天卡片高度精确设为「卡片顶部到屏幕底部」，确保输入框紧贴屏幕底边
@@ -990,6 +991,7 @@ function aiSyncUrl(){
 function aiNewChat(){
   if(aiStreaming){ toast('正在回复中，请稍候', true); return; }
   aiConvId = null; aiConvMessages = []; aiConvTitle = ''; aiUsagePending = null; aiPerfPending = null;
+  aiStick = true; // 新对话：从底部开始
   aiSetTitle('');
   aiUpdateUsagePop();
   renderAiMessages();
@@ -1024,6 +1026,7 @@ async function aiOpenConv(id){
   aiConvId = c.id;
   aiConvMessages = Array.isArray(c.messages) ? c.messages : [];
   aiConvTitle = c.title || ''; aiUsagePending = null; aiPerfPending = null;
+  aiStick = true; // 打开会话：默认从底部看
   aiSetTitle(aiConvTitle);
   aiUpdateUsagePop();
   renderAiMessages();
@@ -1155,6 +1158,9 @@ function aiFoldAttr(key, defOpen){
 }
 function renderAiMessages(){
   const box = $('#aiCol'); if(!box) return;
+  // 记录当前滚动位置：用户上滑阅读时，重渲染后要保持在原处（工具调用/流式渲染时尤其容易跳）
+  const scroller = $('#aiMessages');
+  const keepTop = scroller ? scroller.scrollTop : 0;
   if(!aiConvMessages.length){ box.innerHTML = '<div class="empty">开始和 AI 对话吧</div>'; aiUpdateContinueBar(); return; }
   let html = '';
   let i = 0;
@@ -1171,6 +1177,8 @@ function renderAiMessages(){
   box.innerHTML = html;
   aiBindFolds(box);
   aiUpdateContinueBar();
+  // 用户上滑阅读时：重渲染后恢复原滚动位置，避免被拉回底部或顶部
+  if(!aiStick && scroller){ try{ scroller.scrollTop = keepTop; }catch(e){} }
   scrollAiBottom();
 }
 // 撤回：删除该条及其之后的消息，并把该条内容放回输入框
@@ -1402,12 +1410,22 @@ function aiBubbleHtml(role, content, idx, m){
     acts +
   '</div>';
 }
+// 用户是否停在聊天底部附近（用于判断「是否继续自动贴底」）
+function aiNearBottom(box){
+  const b = box || $('#aiMessages'); if(!b) return true;
+  return (b.scrollHeight - b.scrollTop - b.clientHeight) < 120;
+}
+// 贴底意图：用户手动上滑阅读时置 false（不再被强制拉到底部），回到底部附近自动恢复 true
+let aiStick = true;
 // 滚到聊天底部。消息渲染（Markdown/代码块/图片/折叠）可能在设置后继续改变内容高度，
 // 导致停在半路、需要手动下滑；这里用「多帧 + 定时兜底」把这些延迟的高度变化也滚到底。
+// 但用户主动上滑查看上面内容时不再强制贴底（AI 生成过程中同样适用）。
 function scrollAiBottom(){
   const box = $('#aiMessages'); if(!box) return;
   aiEnsureColObserver();
-  const pin = function(){ try{ box.scrollTop = box.scrollHeight; }catch(e){} };
+  if(!aiStick) return;
+  // 每次贴底前都重新判断：用户中途上滑后，后续的延时贴底不再生效
+  const pin = function(){ if(!aiStick) return; try{ box.scrollTop = box.scrollHeight; }catch(e){} };
   pin();
   requestAnimationFrame(function(){ pin(); requestAnimationFrame(pin); });
   clearTimeout(scrollAiBottom._t1); clearTimeout(scrollAiBottom._t2); clearTimeout(scrollAiBottom._t3);
@@ -1415,15 +1433,20 @@ function scrollAiBottom(){
   scrollAiBottom._t2 = setTimeout(pin, 260);
   scrollAiBottom._t3 = setTimeout(pin, 600);
 }
-// 监听聊天内容高度变化：内容变高/变矮时贴底（生成中无条件贴底，生成后仅在用户已在底部附近时贴底）
-let aiColObserver = null;
+// 监听聊天内容高度变化：仅在用户仍处于底部附近时贴底
+let aiColObserver = null, aiScrollBound = false;
 function aiEnsureColObserver(){
   const col = $('#aiCol'), box = $('#aiMessages');
-  if(!col || !box || aiColObserver) return;
+  if(!col || !box) return;
+  if(!aiScrollBound){
+    aiScrollBound = true;
+    // 用户滚动后按「是否在底部附近」更新贴底意图：上滑看历史就不再被拽回底部
+    box.addEventListener('scroll', function(){ aiStick = aiNearBottom(box); });
+  }
+  if(aiColObserver) return;
   try{
     aiColObserver = new ResizeObserver(function(){
-      const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 160;
-      if(aiStreaming || nearBottom) box.scrollTop = box.scrollHeight;
+      if(aiStick) box.scrollTop = box.scrollHeight;
     });
     aiColObserver.observe(col);
   }catch(e){}
@@ -1452,6 +1475,7 @@ async function aiSend(){
   if(!text){ toast('请输入内容', true); return; }
   aiConvMessages.push({ role:'user', content:text });
   if(input){ input.value = ''; aiAutoGrow(); }
+  aiStick = true; // 刚发送：回到「跟随最新回复」状态
   aiSetTitle(aiConvTitle);
   renderAiMessages();
   aiSaveProgress();   // 先落盘用户提问，刷新后不会整轮消失
@@ -2070,30 +2094,31 @@ async function deleteSelectedPosts(){
   const paths=Array.from(selectedPosts);
   if(!paths.length) return;
   if(!confirm('确认删除所选 '+paths.length+' 篇文章？将移入回收站，可恢复。')) return;
+  opBanner('正在删除所选 '+paths.length+' 篇文章…','busy');
   const r=await api(API_BASE+'/posts/delete',{method:'POST',body:JSON.stringify({paths:paths})});
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.ok){
-    toast('已移入回收站 '+(r.data.moved||0)+'/'+(r.data.total||paths.length)+' 篇，已推送到 GitHub');
+    opBannerEnd('已删除 '+(r.data.moved||0)+'/'+(r.data.total||paths.length)+' 篇（已推送到 GitHub）',true);
     await loadPosts();
-  } else toast('批量删除失败：'+(r.data&&r.data.error||r.status),true);
+  } else opBannerEnd('批量删除失败：'+(r.data&&r.data.error||r.status),false);
 }
 async function batchUploadPosts(files){
   if(!files||!files.length) return;
-  toast('读取文件中…');
+  opBanner('正在读取 '+files.length+' 个文件…','busy');
   const out=[];
   for(let i=0;i<files.length;i++){
     try{ out.push({name:files[i].name, content:await files[i].text()}); }
-    catch(e){ toast('读取「'+files[i].name+'」失败',true); return; }
+    catch(e){ opBannerEnd('读取「'+files[i].name+'」失败',false); return; }
   }
-  toast('上传中…');
+  opBanner('正在上传 '+out.length+' 篇文章…','busy');
   const r=await api(API_BASE+'/posts/upload',{method:'POST',body:JSON.stringify({files:out})});
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.created>0){
-    toast('已上传 '+(r.data.created||0)+'/'+(r.data.total||out.length)+' 篇，已推送到 GitHub');
+    opBannerEnd('已上传 '+(r.data.created||0)+'/'+(r.data.total||out.length)+' 篇（已推送到 GitHub）',true);
     await loadPosts();
   } else {
     const firstErr=(r.data&&r.data.results&&r.data.results[0]&&r.data.results[0].error)||(r.data&&r.data.error)||r.status;
-    toast('上传失败：'+firstErr,true);
+    opBannerEnd('上传失败：'+firstErr,false);
   }
 }
 function onListClick(e){
@@ -2135,24 +2160,26 @@ async function savePost(){
   if(editingPath) body.path=editingPath;
   const isUpd=!!editingPath;
   $('#saveBtn').disabled=true; $('#saveBtn').textContent='提交中...';
+  opBanner(isUpd?'正在保存修改…':'正在发布文章…','busy');
   const r=await api(API_BASE+'/post',{method:isUpd?'PUT':'POST',body:JSON.stringify(body)});
   $('#saveBtn').disabled=false; $('#saveBtn').textContent=isUpd?'保存修改':'发布文章';
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.ok){
-    toast(isUpd?'已保存并推送到 GitHub':'已发布并推送到 GitHub');
     clearDraft();
     go('manage');
-  } else toast('保存失败：'+(r.data&&r.data.error||r.status),true);
+    opBannerEnd(isUpd?'已保存并推送到 GitHub':'已发布并推送到 GitHub',true);
+  } else opBannerEnd('保存失败：'+(r.data&&r.data.error||r.status),false);
 }
 async function delPost(path,name){
   if(!confirm('确认删除文章「'+name+'」？将移入回收站，可恢复。')) return;
+  opBanner('正在删除文章「'+name+'」…','busy');
   const r=await api(API_BASE+'/post?path='+encodeURIComponent(path),{method:'DELETE'});
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.ok){
-    toast('已移入回收站，已推送到 GitHub');
+    opBannerEnd('已删除文章「'+name+'」（已推送到 GitHub）',true);
     loadPosts();
   }
-  else toast('删除失败：'+(r.data&&r.data.error||r.status),true);
+  else opBannerEnd('删除失败：'+(r.data&&r.data.error||r.status),false);
 }
 
 // ---------- Vditor「分屏复杂模式」----------
@@ -2278,6 +2305,7 @@ function dismissBuildBanner(id){
 }
 // 进入管理页 / AI 操作工作流后：按「所有正在运行的工作流」刷新横幅；无运行中则显示最近一次结果
 async function initBuildStatus(){
+  if(opBannerBusy) return; // 有本地操作正在进行：不要用工作流状态覆盖操作日志
   const r=await api(API_BASE+'/workflows/runs?limit=30');
   const d=r.data||{};
   if(!r.ok||!d||!d.ok) return;
@@ -2321,6 +2349,31 @@ function showBuildBannerHtml(html, cls){
 function hideBuildBanner(){
   buildBannerTargets().forEach((b)=>{ if(b) b.classList.add('hidden'); });
 }
+// ---------- 通用操作日志横幅 ----------
+// 与工作流横幅同一位置：文件删除/上传/克隆等耗时操作显示「正在…」与结果
+let opBannerBusy=false, opBannerTimer=null, opBannerWatchdog=null;
+function opBanner(msg, kind){
+  const b=$('#globalBuildBanner'); if(!b) return;
+  if(opBannerTimer){ clearTimeout(opBannerTimer); opBannerTimer=null; }
+  if(opBannerWatchdog){ clearTimeout(opBannerWatchdog); opBannerWatchdog=null; }
+  opBannerBusy = (kind==='busy');
+  // 兜底：请求异常中止时避免「正在…」一直挂着
+  if(opBannerBusy) opBannerWatchdog=setTimeout(function(){ opBannerBusy=false; const e=$('#globalBuildBanner'); if(e) e.classList.add('hidden'); }, 120000);
+  b.className='build-banner'+(kind==='ok'?' ok':(kind==='err'?' err':''));
+  b.innerHTML=(kind==='busy'?'<span class="build-run-item"><span class="build-dot"></span>':'')+'<span>'+esc(msg)+'</span>';
+  b.classList.remove('hidden');
+}
+// 结束一条操作日志：ok 决定颜色；4 秒后自动隐藏并恢复工作流横幅
+function opBannerEnd(msg, ok){
+  if(opBannerWatchdog){ clearTimeout(opBannerWatchdog); opBannerWatchdog=null; }
+  opBanner(msg, ok?'ok':'err');
+  opBannerBusy=false;
+  if(opBannerTimer) clearTimeout(opBannerTimer);
+  opBannerTimer=setTimeout(function(){
+    const b=$('#globalBuildBanner'); if(b) b.classList.add('hidden');
+    initBuildStatus();
+  }, 4000);
+}
 // 当前是否有可展示的构建结果 + AI 是否已配置（决定是否显示「发给 AI」）
 let aiConfigured=false;
 async function checkAiConfigured(){
@@ -2354,6 +2407,7 @@ function startBuildPoll(){
   let tries=0;
   buildTimer=setInterval(async ()=>{
     tries++;
+    if(opBannerBusy) return; // 本地操作进行中：暂停用工作流状态覆盖操作日志
     const r=await api(API_BASE+'/workflows/runs?limit=30');
     const d=r.data||{};
     if(!r.ok||!d.ok){ if(tries>=12) stopBuildPoll(); return; }
@@ -2634,12 +2688,13 @@ async function fileBatchOp(kind){
     purge:'确认彻底删除所选 '+paths.length+' 项？此操作不可恢复！'
   }[kind];
   if(!confirm(conf)) return;
-  const r=await api(API_BASE+'/files/'+kind,{method:'POST',body:JSON.stringify({paths:paths,branch:curBranch()})});
-  if(r.status===401){ redirectLogin(); return; }
   const key={recycle:'moved',restore:'restored',purge:'purged'}[kind];
   const label={recycle:'移入回收站',restore:'恢复',purge:'彻底删除'}[kind];
-  if(r.ok&&r.data&&r.data[key]>0) toast('已'+label+' '+r.data[key]+'/'+(r.data.total||paths.length)+' 项');
-  else toast(label+'失败：'+(r.data&&r.data.error||r.status),true);
+  opBanner('正在'+label+' '+paths.length+' 项…','busy');
+  const r=await api(API_BASE+'/files/'+kind,{method:'POST',body:JSON.stringify({paths:paths,branch:curBranch()})});
+  if(r.status===401){ redirectLogin(); return; }
+  if(r.ok&&r.data&&r.data[key]>0) opBannerEnd('已'+label+' '+r.data[key]+'/'+(r.data.total||paths.length)+' 项',true);
+  else opBannerEnd(label+'失败：'+(r.data&&r.data.error||r.status),false);
   selectedFiles.clear();
   loadFiles();
 }
@@ -2650,45 +2705,49 @@ async function onFileClick(e){
   if(a==='zip'){
     if(!confirm('解压「'+name+'」到当前目录？\\n小于 50MB 直接解压，大于 50MB 会触发 GitHub 工作流异步解压。')) return;
     const btn0=btn.textContent; btn.disabled=true; btn.textContent='解压中...';
+    opBanner('正在解压「'+name+'」…','busy');
     const r=await api(API_BASE+'/unzip-path',{method:'POST',body:JSON.stringify({path,branch:curBranch()})});
     btn.disabled=false; btn.textContent=btn0;
     if(r.status===401){ redirectLogin(); return; }
     if(r.ok&&r.data&&r.data.workflow){
-      toast(r.data.message||'已触发解压工作流，正在解压...');
+      opBannerEnd('已触发解压「'+name+'」，正在异步解压',true);
       startUnzipPoll();
       return;
     }
-    if(r.ok&&r.data&&r.data.ok) toast(r.data.message||'解压完成');
-    else toast('解压失败：'+(r.data&&r.data.error||r.status),true);
+    if(r.ok&&r.data&&r.data.ok) opBannerEnd(r.data.message||('解压完成「'+name+'」'),true);
+    else opBannerEnd('解压失败：'+(r.data&&r.data.error||r.status),false);
     loadFiles();
     return;
   }
   if(a==='del'){
     if(!confirm('确认删除「'+name+'」？将移入回收站，可恢复。')) return;
+    opBanner('正在删除「'+name+'」…','busy');
     const r=await api(API_BASE+'/files/recycle',{method:'POST',body:JSON.stringify({paths:[path],branch:curBranch()})});
     if(r.status===401){ redirectLogin(); return; }
     const err=(r.data&&r.data.error)||(r.data&&r.data.results&&r.data.results[0]&&r.data.results[0].error);
-    if(r.ok&&r.data&&r.data.ok) toast('已移入回收站');
-    else toast('删除失败：'+(err||r.status),true);
+    if(r.ok&&r.data&&r.data.ok) opBannerEnd('已删除「'+name+'」（已移入回收站）',true);
+    else opBannerEnd('删除失败：'+(err||r.status),false);
     loadFiles();
     return;
   }
   if(a==='restore'){
+    opBanner('正在恢复「'+name+'」…','busy');
     const r=await api(API_BASE+'/files/restore',{method:'POST',body:JSON.stringify({paths:[path],branch:curBranch()})});
     if(r.status===401){ redirectLogin(); return; }
     const err=(r.data&&r.data.error)||(r.data&&r.data.results&&r.data.results[0]&&r.data.results[0].error);
-    if(r.ok&&r.data&&r.data.ok) toast('已恢复');
-    else toast('恢复失败：'+(err||r.status),true);
+    if(r.ok&&r.data&&r.data.ok) opBannerEnd('已恢复「'+name+'」',true);
+    else opBannerEnd('恢复失败：'+(err||r.status),false);
     loadFiles();
     return;
   }
   if(a==='purge'){
     if(!confirm('确认彻底删除「'+name+'」？此操作不可恢复！')) return;
+    opBanner('正在彻底删除「'+name+'」…','busy');
     const r=await api(API_BASE+'/files/purge',{method:'POST',body:JSON.stringify({paths:[path],branch:curBranch()})});
     if(r.status===401){ redirectLogin(); return; }
     const err=(r.data&&r.data.error)||(r.data&&r.data.results&&r.data.results[0]&&r.data.results[0].error);
-    if(r.ok&&r.data&&r.data.ok) toast('已彻底删除');
-    else toast('彻底删除失败：'+(err||r.status),true);
+    if(r.ok&&r.data&&r.data.ok) opBannerEnd('已彻底删除「'+name+'」',true);
+    else opBannerEnd('彻底删除失败：'+(err||r.status),false);
     loadFiles();
     return;
   }
@@ -2721,16 +2780,18 @@ async function onFileListClick(e){
 }
 async function saveFileEdit(){
   const content=$('#fileEditArea').value;
+  opBanner('正在保存文件…','busy');
   const r=await api(API_BASE+'/file',{method:'PUT',body:JSON.stringify({path:fileEditPath,content,branch:curBranch()})});
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.ok){
-    toast('已保存到 GitHub 仓库，如需部署请点击「运行工作流」');
     $('#fileEditor').classList.add('hidden');
     loadFiles();
-  } else toast('保存失败：'+(r.data&&r.data.error||r.status),true);
+    opBannerEnd('已保存到 GitHub 仓库（如需部署请点击「运行工作流」）',true);
+  } else opBannerEnd('保存失败：'+(r.data&&r.data.error||r.status),false);
 }
 async function doUpload(files){
   if(!files.length) return;
+  opBanner('正在上传 '+files.length+' 个文件…','busy');
   const fd=new FormData();
   fd.append('path', filePath);
   fd.append('branch', curBranch());
@@ -2738,18 +2799,19 @@ async function doUpload(files){
   const r=await fetch(API_BASE+'/upload',{method:'POST',body:fd,headers:{Authorization:'Bearer '+token}});
   let d=null; try{ d=await r.json(); }catch(e){}
   if(r.status===401){ redirectLogin(); return; }
-  if(d&&d.ok) toast(d.message||'上传成功');
-  else toast('上传失败：'+(d&&d.error||r.status),true);
+  if(d&&d.ok) opBannerEnd(d.message||'上传成功',true);
+  else opBannerEnd('上传失败：'+(d&&d.error||r.status),false);
   loadFiles();
 }
 function newFolder(){
   const name=prompt('输入文件夹名称：');
   if(!name||!name.trim()) return;
   const target=(filePath?filePath+'/':'')+name.trim();
+  opBanner('正在创建文件夹「'+name.trim()+'」…','busy');
   const r=api(fileApi(API_BASE+'/file'),{method:'PUT',body:JSON.stringify({path:target+'/.gitkeep',content:'',branch:curBranch()})});
   r.then(res=>{
-    if(res.ok&&res.data&&res.data.ok){ toast('已创建 '+name.trim()); loadFiles(); }
-    else toast('创建失败',true);
+    if(res.ok&&res.data&&res.data.ok){ opBannerEnd('已创建文件夹「'+name.trim()+'」',true); loadFiles(); }
+    else opBannerEnd('创建文件夹失败',false);
   });
 }
 // ---------- 文件管理：从网络下载 / 大文件解压状态 ----------
@@ -2759,11 +2821,11 @@ async function downloadFromUrl(){
   const suggest=url.trim().split(/[?#]/)[0].split('/').filter(Boolean).pop()||'';
   const name=prompt('保存的文件名（可修改，留空自动识别）：', /\.[a-z0-9]{2,5}$/i.test(suggest)?suggest:'');
   const dir=filePath?filePath+'/':'';
-  toast('正在下载...');
+  opBanner('正在从网络下载…','busy');
   const r=await api(API_BASE+'/download',{method:'POST',body:JSON.stringify({url:url.trim(),name:(name||'').trim(),path:dir,branch:curBranch()})});
   if(r.status===401){ redirectLogin(); return; }
-  if(r.ok&&r.data&&r.data.ok){ toast(r.data.message||'下载完成'); loadFiles(); }
-  else toast('下载失败：'+(r.data&&r.data.error||r.status),true);
+  if(r.ok&&r.data&&r.data.ok){ opBannerEnd(r.data.message||'下载完成',true); loadFiles(); }
+  else opBannerEnd('下载失败：'+(r.data&&r.data.error||r.status),false);
 }
 let unzipTimer=null, unzipSeen=false, unzipTries=0;
 const UNZIP_DOT='<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--accent);animation:aiWaitPulse 1s infinite;margin-right:6px"></span>';
@@ -2839,18 +2901,18 @@ async function cloneRepoFromUrl(){
   while(name && name.charAt(name.length-1)==='/') name=name.slice(0,-1);
   if(!name) name=slug;
   const target=fromRoot?name:((filePath?filePath+'/':'')+name);
-  toast('正在触发克隆工作流…');
+  opBanner('正在触发克隆「'+name+'」工作流…','busy');
   const r=await api(API_BASE+'/clone-repo',{method:'POST',body:JSON.stringify({repo_url:repo.trim(),target_dir:target,branch:curBranch()})});
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.ok){
-    toast(r.data.message||'已触发克隆工作流');
+    opBannerEnd(r.data.message||('已触发克隆「'+name+'」工作流'),true);
     stopUnzipPoll();
     renderUnzipStatus({running:true,text:'正在克隆「'+name+'」…（约 10 秒完成）'});
     cloneTries=0;
     stopClonePoll();
     cloneTimer=setInterval(()=>clonePollTick(name),2500);
     clonePollTick(name);
-  } else toast('克隆失败：'+(r.data&&r.data.error||r.status),true);
+  } else opBannerEnd('克隆失败：'+(r.data&&r.data.error||r.status),false);
 }
 // 进入文件页时：若后台仍有解压工作流在跑，恢复「正在运行」提示
 async function resumeUnzipStatus(){
