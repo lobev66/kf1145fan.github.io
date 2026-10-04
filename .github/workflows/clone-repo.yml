@@ -1,0 +1,79 @@
+name: 克隆外部仓库到当前仓库
+
+# 由 Cloudflare Worker 在「文件管理 → 克隆仓库」或 AI 的 clone_repo 工具触发（workflow_dispatch）。
+# 也可在 Actions 页面手动运行：把一个外部仓库（例如 Hexo 主题）克隆进当前仓库的某个文件夹。
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "要克隆的仓库：owner/repo 或完整 URL"
+        required: true
+        type: string
+      target_dir:
+        description: "目标目录（克隆到当前仓库的哪个文件夹，如 themes/next）"
+        required: true
+        type: string
+      branch:
+        description: "提交到当前仓库的分支"
+        required: false
+        default: "main"
+        type: string
+      ref:
+        description: "源仓库的分支或标签（留空用默认分支）"
+        required: false
+        default: ""
+        type: string
+      keep_git:
+        description: "是否保留 .git（true/false，默认 false 仅保留文件）"
+        required: false
+        default: "false"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  clone:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: 克隆并提交
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          TARGET_DIR: ${{ inputs.target_dir }}
+          BRANCH: ${{ inputs.branch }}
+          SRC_REF: ${{ inputs.ref }}
+          KEEP_GIT: ${{ inputs.keep_git }}
+        run: |
+          set -e
+          URL="$REPO_URL"
+          case "$URL" in
+            http*|git@*) : ;;
+            *) URL="https://github.com/${URL%.git}.git" ;;
+          esac
+          DIR="$TARGET_DIR"
+          DIR="${DIR#/}"; DIR="${DIR%/}"
+          if [ -z "$DIR" ]; then echo "target_dir 不能为空"; exit 1; fi
+          if [ -e "$DIR" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
+            echo "目标目录 $DIR 已存在且非空，中止（避免覆盖已有文件）"
+            exit 1
+          fi
+          mkdir -p "$DIR"
+          if [ -n "$SRC_REF" ]; then
+            git clone --depth 1 --branch "$SRC_REF" "$URL" "$DIR"
+          else
+            git clone --depth 1 "$URL" "$DIR"
+          fi
+          if [ "$KEEP_GIT" != "true" ]; then rm -rf "$DIR/.git"; fi
+          git config user.name "clone-bot"
+          git config user.email "clone-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "没有需要提交的变更"
+            exit 0
+          fi
+          git commit -m "chore: clone $REPO_URL -> $DIR"
+          git push origin "HEAD:$BRANCH"

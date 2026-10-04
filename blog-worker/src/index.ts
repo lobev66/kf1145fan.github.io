@@ -370,6 +370,32 @@ app.get("/admin/api/build/log", async (c) => {
   return handleBuildLog(c.env as Bindings, c.req.query("id") || "");
 });
 
+// ---------- 通用工作流管理（列出 / 运行记录 / 运行 / 取消 / 克隆仓库）----------
+app.get("/admin/api/workflows", async (c) => {
+  if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
+  return handleListWorkflows(c.env as Bindings);
+});
+
+app.get("/admin/api/workflows/runs", async (c) => {
+  if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
+  return handleWorkflowRuns(c.env as Bindings, c.req.query("workflow") || "");
+});
+
+app.post("/admin/api/workflows/trigger", async (c) => {
+  if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
+  return handleTriggerWorkflow(c.env as Bindings, await c.req.json().catch(() => ({})));
+});
+
+app.post("/admin/api/workflows/cancel", async (c) => {
+  if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
+  return handleCancelWorkflow(c.env as Bindings, await c.req.json().catch(() => ({})));
+});
+
+app.post("/admin/api/clone-repo", async (c) => {
+  if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
+  return handleCloneRepo(c.env as Bindings, await c.req.json().catch(() => ({})));
+});
+
 // ---------- 访问量（仅管理员可见）----------
 // 最近 N 天趋势：/admin/api/visit/daily?days=30
 app.get("/admin/api/visit/daily", async (c) => {
@@ -1001,6 +1027,11 @@ const AI_TOOLS = [
   { type: "function", function: { name: "unzip_file", description: "解压仓库内已有的 zip 文件到它所在目录：小于 50MB 由 Cloudflare 即时解压；大于 50MB 自动触发 GitHub 工作流异步解压。", parameters: { type: "object", properties: { path: { type: "string", description: "zip 文件在仓库中的完整路径" }, branch: { type: "string", description: "可选：分支" } }, required: ["path"] } } },
   { type: "function", function: { name: "unzip_status", description: "查询大文件解压工作流（unzip.yml）的运行状态与最近结果。", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "get_build_logs", description: "获取部署工作流（deploy.yml）的运行日志文本，用于排查构建失败原因。runId 可省略，默认取最近一次运行。", parameters: { type: "object", properties: { runId: { type: "string", description: "可选：工作流 run id，省略则为最近一次" } } } } },
+  { type: "function", function: { name: "list_workflows", description: "列出博客仓库中所有可用的 GitHub 工作流（名称、文件名、状态）。运行指定工作流前可先调用它确认文件名。", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "workflow_runs", description: "查询工作流的运行记录（默认查全部，可传 workflow 指定某个工作流的文件名，如 deploy.yml、clone-repo.yml），用于了解当前是否有工作流在运行及最近结果。", parameters: { type: "object", properties: { workflow: { type: "string", description: "可选：工作流文件名，省略则查全部工作流" } } } } },
+  { type: "function", function: { name: "trigger_workflow", description: "触发运行指定的 GitHub 工作流。workflow_id 传工作流文件名（如 clone-repo.yml、deploy.yml）或工作流名称；可用 inputs 传 workflow_dispatch 的输入参数。", parameters: { type: "object", properties: { workflow_id: { type: "string", description: "工作流文件名（如 clone-repo.yml）或名称" }, ref: { type: "string", description: "可选：分支，默认当前分支" }, inputs: { type: "object", description: "可选：workflow_dispatch 输入参数键值对" } }, required: ["workflow_id"] } } },
+  { type: "function", function: { name: "cancel_workflow", description: "取消正在运行的 GitHub 工作流。runId 可省略，默认取消最近一次仍在运行的工作流。", parameters: { type: "object", properties: { runId: { type: "string", description: "可选：要取消的 run id，省略则取消最近一次运行中的工作流" } } } } },
+  { type: "function", function: { name: "clone_repo", description: "把一个外部 Git 仓库克隆到当前博客仓库的指定目录（例如克隆一个 Hexo 主题到 themes/xxx）。由 GitHub 工作流异步完成，约 10 秒。repo_url 支持 owner/repo 或完整 URL。", parameters: { type: "object", properties: { repo_url: { type: "string", description: "要克隆的仓库：owner/repo 或完整 URL" }, target_dir: { type: "string", description: "目标目录，如 themes/next" }, ref: { type: "string", description: "可选：源仓库的分支或标签" }, branch: { type: "string", description: "可选：提交到当前仓库的分支" } }, required: ["repo_url", "target_dir"] } } },
 ];
 
 // set_setting 允许修改的设置项（站点功能走 wl_Settings，其余写入订阅/SMTP 配置）
@@ -1012,7 +1043,7 @@ const AI_SETTING_KEYS = [
 ];
 
 // 危险工具：需要「重要确认」及以上权限时需用户确认
-const AI_DANGER_TOOLS = ["write_file", "delete_file", "trigger_build", "set_setting", "save_secret", "send_email", "http_post", "download_file", "unzip_file"];
+const AI_DANGER_TOOLS = ["write_file", "delete_file", "trigger_build", "set_setting", "save_secret", "send_email", "http_post", "download_file", "unzip_file", "trigger_workflow", "cancel_workflow", "clone_repo"];
 
 // 生成工具使用说明（含可用密钥占位符名称，绝不含密钥值）
 async function aiToolsHint(db: D1Database): Promise<string> {
@@ -1029,6 +1060,8 @@ async function aiToolsHint(db: D1Database): Promise<string> {
     "联网：用 http_get 抓取网页或调用 GET 类接口，用 http_post 提交数据或调用写入类接口（需 http(s):// 开头，可自定义 headers/contentType）。响应体会自动截断，超长内容请分页或改用接口的查询参数。",
     "下载与解压：用 download_file 把网络上的文件（含 GitHub 仓库 owner/repo 源码 zip）保存进仓库；用 unzip_file 解压仓库里的 zip（<50MB 即时完成，>50MB 触发 GitHub 工作流异步解压，可用 unzip_status 查看进度）。",
     "部署排错：用 build_status 查看部署状态；用 get_build_logs 拉取部署工作流日志文本（可传 runId，省略则取最近一次），用于分析构建失败原因。",
+    "工作流控制：用 list_workflows 查看仓库里有哪些工作流；用 workflow_runs 查看运行记录（可传 workflow 文件名）；用 trigger_workflow 运行指定的工作流（workflow_id 传文件名如 deploy.yml，可带 inputs）；用 cancel_workflow 停止当前正在运行的工作流（可传 runId，省略则取消最近一次运行中的）。",
+    "克隆仓库：用 clone_repo 把外部仓库（如一个 Hexo 主题）克隆到当前仓库的指定目录，例如 repo_url=theme-next/hexo-theme-next, target_dir=themes/next；由 GitHub 工作流异步完成。",
     names.length
       ? "当前可用的密钥占位符：" + names.map((n) => "{" + n + "}").join("、")
       : "当前没有配置任何密钥占位符（管理员可在「设置 → AI 密钥」中添加）。",
@@ -1239,6 +1272,23 @@ async function aiRunTool(env: Bindings, name: string, args: Record<string, unkno
       return jr(await handleUnzipByPath(env, { path: s("path"), branch: s("branch") }));
     case "unzip_status":
       return jr(await handleUnzipStatus(env));
+    case "list_workflows":
+      return jr(await handleListWorkflows(env));
+    case "workflow_runs":
+      return jr(await handleWorkflowRuns(env, s("workflow")));
+    case "trigger_workflow":
+      return jr(await handleTriggerWorkflow(env, { workflow_id: s("workflow_id"), ref: s("ref"), inputs: args.inputs }));
+    case "cancel_workflow":
+      return jr(await handleCancelWorkflow(env, { run_id: s("runId") }));
+    case "clone_repo":
+      return jr(
+        await handleCloneRepo(env, {
+          repo_url: s("repo_url"),
+          target_dir: s("target_dir"),
+          ref: s("ref"),
+          branch: s("branch"),
+        })
+      );
     default:
       return JSON.stringify({ ok: false, error: "未知工具：" + name });
   }
@@ -2204,44 +2254,13 @@ async function handleWritePost(
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return json({ ok: false, error: "github error: " + (data as any).message || res.status }, 502);
 
-    // 仅「添加新文章」时触发构建，并在构建完成后由工作流回调通知订阅者。
-    // 手动运行工作流不会带 notify 参数，所以不会发邮件。
-    let notifyPipeline = false;
-    if (!isUpdate) {
-      // 优先用站点对外地址（SITE_URL，未配置时由中间件取当前请求域名），回退到 GitHub Pages 地址
-      const pagesUrl =
-        (env.SITE_URL || "").trim().replace(/\/+$/, "") || pagesBaseUrl(env);
-      const pageTitle = filename.replace(/\.md$/, "");
-      const postUrl = pagesUrl
-        ? pagesUrl +
-          "/" +
-          (date.replace(/-/g, "/") + "/" + pageTitle)
-            .split("/")
-            .map(encodeURIComponent)
-            .join("/") +
-          "/"
-        : path;
-      const disp = await fetch(
-        `https://api.github.com/repos/${repo}/actions/workflows/update-gh.yml/dispatches`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            ref: branch,
-            inputs: { notify: "true", post_title: title, post_url: postUrl },
-          }),
-        }
-      ).catch(() => null);
-      notifyPipeline = !!disp && disp.ok;
-    }
+    // 发布/更新文章默认只推送到 GitHub，不自动触发重建（避免每次都跑一整轮部署）。
+    // 需要更新站点时，由管理员在「部署记录」点「手动运行工作流」，或用 AI 的 trigger_workflow 触发。
     return json({
       ok: true,
       path,
       filename,
-      notifyPipeline,
-      message: notifyPipeline
-        ? "已提交，正在构建博客；构建完成后会自动邮件通知订阅者"
-        : "已提交，工作流会自动重建博客",
+      message: "已提交并推送到 GitHub，如需更新站点请点「运行工作流」",
     });
   } catch (e) {
     return json({ ok: false, error: String(e) }, 500);
@@ -2639,6 +2658,154 @@ async function handleBuildLog(env: Bindings, runId: string): Promise<Response> {
     const truncated = text.length > max;
     if (truncated) text = "...(日志过长，已截断，仅保留末尾)\n" + text.slice(-max);
     return json({ ok: true, id, truncated, text });
+  } catch (e) {
+    return json({ ok: false, error: String(e) }, 500);
+  }
+}
+
+// ---------- 通用工作流管理（列出 / 运行 / 取消 / 运行记录 / 克隆仓库）----------
+const GH_ACTIVE_STATES = ["in_progress", "queued", "pending", "waiting", "requested"];
+
+// 列出仓库中所有工作流（名称、文件名、状态）
+async function handleListWorkflows(env: Bindings): Promise<Response> {
+  const { token, repo, headers } = ghConfig(env);
+  if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows?per_page=100`, { headers });
+    if (!res.ok) return json({ ok: false, error: "github error " + res.status }, 502);
+    const data = (await res.json()) as any;
+    const workflows = ((data.workflows || []) as any[]).map((w: any) => ({
+      id: w.id,
+      name: w.name || "",
+      file: w.path ? String(w.path).split("/").pop() : "",
+      path: w.path || "",
+      state: w.state || "",
+    }));
+    return json({ ok: true, workflows });
+  } catch (e) {
+    return json({ ok: false, error: String(e) }, 500);
+  }
+}
+
+// 查询工作流运行记录（workflow 为文件名，省略则查全部）
+async function handleWorkflowRuns(env: Bindings, workflow: string): Promise<Response> {
+  const { token, repo, headers } = ghConfig(env);
+  if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
+  const wf = String(workflow || "").trim();
+  try {
+    const url = wf
+      ? `https://api.github.com/repos/${repo}/actions/workflows/${encodeURIComponent(wf)}/runs?per_page=5`
+      : `https://api.github.com/repos/${repo}/actions/runs?per_page=10`;
+    const res = await fetch(url, { headers });
+    if (!res.ok) return json({ ok: false, error: "github error " + res.status }, 502);
+    const data = (await res.json()) as any;
+    const runs = ((data.workflow_runs || []) as any[]).map((r: any) => ({
+      id: r.id,
+      name: r.name || r.display_title || "",
+      workflow: r.path ? String(r.path).split("/").pop() : "",
+      status: r.status,
+      conclusion: r.conclusion || "",
+      created_at: r.created_at || "",
+      html_url: r.html_url || "",
+    }));
+    const running = runs.some((r: any) => GH_ACTIVE_STATES.indexOf(r.status) >= 0);
+    return json({ ok: true, workflow: wf, running, latest: runs[0] || null, runs });
+  } catch (e) {
+    return json({ ok: false, error: String(e) }, 500);
+  }
+}
+
+// 触发指定工作流（workflow_id 支持文件名 / 名称）
+async function handleTriggerWorkflow(env: Bindings, body: any): Promise<Response> {
+  const { token, repo, branch, headers } = ghConfig(env);
+  if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
+  let wid = String(body.workflow_id || "").trim();
+  if (!wid) return json({ ok: false, error: "workflow_id required" }, 400);
+  const ref = String(body.ref || "").trim() || branch;
+  const inputs = body.inputs && typeof body.inputs === "object" ? body.inputs : undefined;
+  try {
+    // 传名称时先列出工作流匹配出文件名
+    if (!/\.ya?ml$/i.test(wid) && !/^\d+$/.test(wid)) {
+      const lr = await fetch(`https://api.github.com/repos/${repo}/actions/workflows?per_page=100`, { headers });
+      if (lr.ok) {
+        const d = (await lr.json()) as any;
+        const w = ((d.workflows || []) as any[]).find((x: any) => x.name === wid);
+        if (w && w.path) wid = String(w.path).split("/").pop() || wid;
+      }
+    }
+    const payload: any = { ref };
+    if (inputs) payload.inputs = inputs;
+    const res = await fetch(
+      `https://api.github.com/repos/${repo}/actions/workflows/${encodeURIComponent(wid)}/dispatches`,
+      { method: "POST", headers, body: JSON.stringify(payload) },
+    );
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      return json({ ok: false, error: "触发失败 github error " + res.status, detail: detail.slice(0, 300) }, 502);
+    }
+    return json({ ok: true, workflow: wid, message: "已触发工作流 " + wid });
+  } catch (e) {
+    return json({ ok: false, error: String(e) }, 500);
+  }
+}
+
+// 取消运行中的工作流（run_id 省略则取消最近一次运行中的）
+async function handleCancelWorkflow(env: Bindings, body: any): Promise<Response> {
+  const { token, repo, headers } = ghConfig(env);
+  if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
+  try {
+    let id = String(body.run_id || "").trim();
+    if (!id) {
+      const lr = await fetch(`https://api.github.com/repos/${repo}/actions/runs?per_page=20`, { headers });
+      if (!lr.ok) return json({ ok: false, error: "github error " + lr.status }, 502);
+      const ld = (await lr.json()) as any;
+      const active = ((ld.workflow_runs || []) as any[]).find((r: any) => GH_ACTIVE_STATES.indexOf(r.status) >= 0);
+      if (!active) return json({ ok: false, error: "当前没有正在运行的工作流" }, 404);
+      id = String(active.id);
+    }
+    const res = await fetch(`https://api.github.com/repos/${repo}/actions/runs/${id}/cancel`, { method: "POST", headers });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      return json({ ok: false, error: "取消失败 github error " + res.status, detail: detail.slice(0, 300) }, 502);
+    }
+    return json({ ok: true, runId: id, message: "已取消工作流运行 #" + id });
+  } catch (e) {
+    return json({ ok: false, error: String(e) }, 500);
+  }
+}
+
+// 克隆外部仓库到当前仓库目录（触发 clone-repo.yml）
+async function handleCloneRepo(env: Bindings, body: any): Promise<Response> {
+  const { token, repo, headers } = ghConfig(env);
+  const useBranch = String(body.branch || "").trim() || ghConfig(env).branch;
+  if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
+  const repoUrl = String(body.repo_url || "").trim();
+  const targetDir = String(body.target_dir || "").trim().replace(/^\/+|\/+$/g, "");
+  const srcRef = String(body.ref || "").trim();
+  if (!repoUrl) return json({ ok: false, error: "repo_url required" }, 400);
+  if (!targetDir) return json({ ok: false, error: "target_dir required" }, 400);
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${repo}/actions/workflows/clone-repo.yml/dispatches`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          ref: useBranch,
+          inputs: { repo_url: repoUrl, target_dir: targetDir, branch: useBranch, ref: srcRef, keep_git: "false" },
+        }),
+      },
+    );
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      return json({ ok: false, error: "触发克隆工作流失败 github error " + res.status, detail: detail.slice(0, 300) }, 502);
+    }
+    return json({
+      ok: true,
+      workflow: true,
+      running: true,
+      message: "已触发克隆工作流，正在把 " + repoUrl + " 克隆到 " + targetDir + "（约 10 秒完成）",
+    });
   } catch (e) {
     return json({ ok: false, error: String(e) }, 500);
   }

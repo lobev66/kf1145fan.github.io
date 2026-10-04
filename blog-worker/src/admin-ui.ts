@@ -1386,7 +1386,31 @@ function aiBubbleHtml(role, content, idx, m){
     acts +
   '</div>';
 }
-function scrollAiBottom(){ const box = $('#aiMessages'); if(box) box.scrollTop = box.scrollHeight; }
+// 滚到聊天底部。消息渲染（Markdown/代码块/图片/折叠）可能在设置后继续改变内容高度，
+// 导致停在半路、需要手动下滑；这里用「多帧 + 定时兜底」把这些延迟的高度变化也滚到底。
+function scrollAiBottom(){
+  const box = $('#aiMessages'); if(!box) return;
+  aiEnsureColObserver();
+  const pin = function(){ try{ box.scrollTop = box.scrollHeight; }catch(e){} };
+  pin();
+  requestAnimationFrame(function(){ pin(); requestAnimationFrame(pin); });
+  clearTimeout(scrollAiBottom._t1); clearTimeout(scrollAiBottom._t2);
+  scrollAiBottom._t1 = setTimeout(pin, 80);
+  scrollAiBottom._t2 = setTimeout(pin, 260);
+}
+// 监听聊天内容高度变化：生成过程中（或用户已在底部附近）内容变高时保持贴底
+let aiColObserver = null;
+function aiEnsureColObserver(){
+  const col = $('#aiCol'), box = $('#aiMessages');
+  if(!col || !box || aiColObserver) return;
+  try{
+    aiColObserver = new ResizeObserver(function(){
+      const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 120;
+      if(aiStreaming || nearBottom) box.scrollTop = box.scrollHeight;
+    });
+    aiColObserver.observe(col);
+  }catch(e){}
+}
 function aiStop(){ if(aiAbort){ try{ aiAbort.abort(); }catch(e){} } }
 // 发送键状态：生成中原地变成灰色「停止」按钮（同一个按钮，不额外加按钮）
 function aiSetSendState(busy){
@@ -1963,9 +1987,8 @@ async function deleteSelectedPosts(){
   const r=await api(API_BASE+'/posts/delete',{method:'POST',body:JSON.stringify({paths:paths})});
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.ok){
-    toast('已移入回收站 '+(r.data.moved||0)+'/'+(r.data.total||paths.length)+' 篇');
+    toast('已移入回收站 '+(r.data.moved||0)+'/'+(r.data.total||paths.length)+' 篇，已推送到 GitHub');
     await loadPosts();
-    await launchDeploy('已删除所选文章，工作流正在重建站点…');
   } else toast('批量删除失败：'+(r.data&&r.data.error||r.status),true);
 }
 async function batchUploadPosts(files){
@@ -1980,9 +2003,8 @@ async function batchUploadPosts(files){
   const r=await api(API_BASE+'/posts/upload',{method:'POST',body:JSON.stringify({files:out})});
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.created>0){
-    toast('已上传 '+(r.data.created||0)+'/'+(r.data.total||out.length)+' 篇');
+    toast('已上传 '+(r.data.created||0)+'/'+(r.data.total||out.length)+' 篇，已推送到 GitHub');
     await loadPosts();
-    await launchDeploy('已上传文章，工作流正在重建站点…');
   } else {
     const firstErr=(r.data&&r.data.results&&r.data.results[0]&&r.data.results[0].error)||(r.data&&r.data.error)||r.status;
     toast('上传失败：'+firstErr,true);
@@ -2031,9 +2053,8 @@ async function savePost(){
   $('#saveBtn').disabled=false; $('#saveBtn').textContent=isUpd?'保存修改':'发布文章';
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.ok){
-    toast(isUpd?'保存成功，已触发部署':'发布成功，已触发部署');
+    toast(isUpd?'已保存并推送到 GitHub':'已发布并推送到 GitHub');
     clearDraft();
-    await launchDeploy('已发布，部署工作流正在重建站点…');
     go('manage');
   } else toast('保存失败：'+(r.data&&r.data.error||r.status),true);
 }
@@ -2042,23 +2063,10 @@ async function delPost(path,name){
   const r=await api(API_BASE+'/post?path='+encodeURIComponent(path),{method:'DELETE'});
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.ok){
-    toast('已移入回收站');
+    toast('已移入回收站，已推送到 GitHub');
     loadPosts();
-    await launchDeploy('已删除「'+name+'」，工作流正在重建站点…');
   }
   else toast('删除失败：'+(r.data&&r.data.error||r.status),true);
-}
-// 触发部署工作流并轮询进度（保存/删除文章时自动发布；文件保存不调用）
-async function launchDeploy(msg){
-  const r=await api(API_BASE+'/build/trigger',{method:'POST'});
-  if(r.ok&&r.data&&r.data.ok){
-    showBuildBanner(msg||'已触发部署工作流，正在重建站点…');
-    setTimeout(pollBuild, 3000);
-    return true;
-  } else {
-    showBuildBanner('代码已推送到 GitHub，但自动触发部署失败，请点「运行工作流」手动部署','err');
-    return false;
-  }
 }
 
 // ---------- Vditor「分屏复杂模式」----------
@@ -2295,7 +2303,6 @@ async function loadBuildHistory(){
       '<td style="white-space:nowrap">'+
         '<a class="wk-btn ghost sm" href="'+esc(rn.html_url)+'" target="_blank" rel="noopener" title="在 GitHub 打开">↗</a> '+
         '<button class="wk-btn ghost sm" onclick="showBuildLog(\\''+id+'\\')">查看日志</button>'+
-        (aiConfigured?' <button class="wk-btn ghost sm" onclick="sendBuildLogsToAi(\\''+id+'\\')">发给 AI</button>':'')+
       '</td></tr>';
   });
   html+='</tbody></table>';
@@ -2318,8 +2325,6 @@ async function showBuildLog(runId){
   const gh=$('#logModalGh');
   if(gh) gh.href=logModalRunId?('https://github.com/__REPO__/actions/runs/'+logModalRunId):'https://github.com/__REPO__/actions';
   const ttl=$('#logModalTitle'); if(ttl) ttl.textContent=logModalRunId?('#'+logModalRunId):'（最近一次）';
-  const ai=$('#logModalAi');
-  if(ai){ ai.classList.toggle('hidden', !aiConfigured); ai.onclick=()=>sendBuildLogsToAi(logModalRunId); }
   body.textContent='正在从 GitHub 获取日志（经 Cloudflare 代理）…';
   const d=await fetchBuildLog(logModalRunId);
   if(!d){ body.textContent='获取日志失败，请稍后重试，或点右上角「在 GitHub 打开」查看。'; return; }
@@ -2596,11 +2601,12 @@ function renderUnzipStatus(info){
   const el=$('#unzipStatus'); if(!el) return;
   if(!info){ el.classList.add('hidden'); el.innerHTML=''; return; }
   el.classList.remove('hidden');
+  const label=info.label||'解压工作流';
   if(info.running){
-    el.innerHTML=UNZIP_DOT+'<span>正在运行解压工作流…（大文件解压，约 10 秒完成）</span>';
+    el.innerHTML=UNZIP_DOT+'<span>'+(info.text||'正在运行解压工作流…（大文件解压，约 10 秒完成）')+'</span>';
   }else{
     const okc=info.conclusion==='success';
-    el.innerHTML='解压工作流已结束：'+(okc?'✅ 成功':'⚠️ '+(info.conclusion||'未知'))+
+    el.innerHTML=label+'已结束：'+(okc?'✅ 成功':'⚠️ '+(info.conclusion||'未知'))+
       (info.html_url?' <a href="'+info.html_url+'" target="_blank" style="color:var(--accent)">查看日志</a>':'');
     setTimeout(()=>{ const e2=$('#unzipStatus'); if(e2){ e2.classList.add('hidden'); e2.innerHTML=''; } },6000);
   }
@@ -2626,10 +2632,51 @@ async function unzipPollTick(){
 }
 function startUnzipPoll(){
   if(unzipTimer) return;
+  stopClonePoll();
   unzipSeen=false; unzipTries=0;
   renderUnzipStatus({running:true});
   unzipTimer=setInterval(unzipPollTick,2500);
   unzipPollTick();
+}
+// ---------- 文件管理：克隆外部仓库（触发 clone-repo.yml）----------
+let cloneTimer=null, cloneTries=0;
+function stopClonePoll(){ if(cloneTimer){ clearInterval(cloneTimer); cloneTimer=null; } }
+async function clonePollTick(target){
+  cloneTries++;
+  const r=await api(API_BASE+'/workflows/runs?workflow=clone-repo.yml');
+  if(r.status===401){ redirectLogin(); return; }
+  const d=r.data||{};
+  if(!r.ok||!d.ok){ if(cloneTries>=8){ stopClonePoll(); renderUnzipStatus(null); } return; }
+  if(d.running){ renderUnzipStatus({running:true,text:'正在克隆「'+(target||'目标目录')+'」…（约 10 秒完成）'}); return; }
+  // 触发后 GitHub 记录 run 有几秒延迟，前几轮没观察到结果时继续等
+  if(!d.latest && cloneTries<8) return;
+  stopClonePoll();
+  const latest=d.latest;
+  if(!latest){ renderUnzipStatus({label:'克隆工作流',conclusion:'未发现运行记录（可能触发失败）'}); return; }
+  renderUnzipStatus({label:'克隆工作流',conclusion:latest.conclusion,html_url:latest.html_url});
+  if(latest.conclusion==='success') loadFiles();
+}
+async function cloneRepoFromUrl(){
+  if(!confirm('克隆一个外部仓库到当前目录？\\n将自动触发 GitHub 工作流完成（约 10 秒），目标文件夹已存在且非空时会中止。')) return;
+  const repo=prompt('输入要克隆的仓库（owner/repo 或完整 URL），例如 Hexo 主题：');
+  if(!repo||!repo.trim()) return;
+  const slug=(repo.trim().split('/').filter(Boolean).pop()||'repo').replace(/\.git$/,'');
+  const sub=prompt('克隆到当前目录下的文件夹名：', slug);
+  if(sub===null) return;
+  const name=(sub.trim()||slug);
+  const target=(filePath?filePath+'/':'')+name;
+  toast('正在触发克隆工作流…');
+  const r=await api(API_BASE+'/clone-repo',{method:'POST',body:JSON.stringify({repo_url:repo.trim(),target_dir:target,branch:curBranch()})});
+  if(r.status===401){ redirectLogin(); return; }
+  if(r.ok&&r.data&&r.data.ok){
+    toast(r.data.message||'已触发克隆工作流');
+    stopUnzipPoll();
+    renderUnzipStatus({running:true,text:'正在克隆「'+name+'」…（约 10 秒完成）'});
+    cloneTries=0;
+    stopClonePoll();
+    cloneTimer=setInterval(()=>clonePollTick(name),2500);
+    clonePollTick(name);
+  } else toast('克隆失败：'+(r.data&&r.data.error||r.status),true);
 }
 // 进入文件页时：若后台仍有解压工作流在跑，恢复「正在运行」提示
 async function resumeUnzipStatus(){
@@ -2770,6 +2817,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   $('#upInput').onchange=e=>{ doUpload(Array.from(e.target.files||[])); e.target.value=''; };
   $('#upDirBtn').onclick=upLevel;
   $('#dlUrlBtn').onclick=downloadFromUrl;
+  $('#cloneRepoBtn').onclick=cloneRepoFromUrl;
   const lm=$('#logModal'); if(lm) lm.addEventListener('click',e=>{ if(e.target===lm) closeLogModal(); });
   $('#branchSel').onchange=e=>{ fileBranch=e.target.value||'main'; filePath=''; loadFiles(); };
   $('#newFolderBtn').onclick=newFolder;
@@ -2922,6 +2970,7 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
           <button class="wk-btn ghost sm" id="upDirBtn" title="返回上一级">← 上一级</button>
           <button class="wk-btn sm" id="upBtn">上传</button>
           <button class="wk-btn ghost sm" id="dlUrlBtn" title="从网络下载文件保存到当前目录">从网络下载</button>
+          <button class="wk-btn ghost sm" id="cloneRepoBtn" title="把外部 Git 仓库克隆到当前目录（如克隆一个 Hexo 主题）">克隆仓库</button>
           <button class="wk-btn ghost sm" id="newFolderBtn">新建文件夹</button>
           <button class="wk-btn ghost sm" id="recycleBtn">回收站</button>
         </div>
@@ -3451,7 +3500,6 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
       <h3 class="wk-title" style="margin:0;border:none;padding:0">工作流日志<span id="logModalTitle" class="wk-label" style="margin-left:8px"></span></h3>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <a class="wk-btn ghost sm" id="logModalGh" target="_blank" rel="noopener">在 GitHub 打开 ↗</a>
-        <button class="wk-btn ghost sm hidden" id="logModalAi">发给 AI</button>
         <button class="wk-btn ghost sm" onclick="closeLogModal()">关闭</button>
       </div>
     </div>
