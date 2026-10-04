@@ -44,6 +44,9 @@ a{color:var(--accent);text-decoration:none}
 .build-banner.ok{color:#1a7f37;background:#d1f5d3;border-color:transparent}
 .build-banner.err{color:var(--danger);background:rgba(220,38,38,.08);border-color:transparent}
 @media(prefers-color-scheme:dark){.build-banner.ok{color:#4ade80;background:rgba(74,222,128,.12)}}
+/* 横幅右侧「关闭」按钮（仅终态成功/失败提供，运行中不给） */
+.build-x{margin-left:auto;border:0;background:transparent;color:inherit;opacity:.6;font-size:16px;line-height:1;cursor:pointer;padding:2px 7px;border-radius:4px}
+.build-x:hover{opacity:1;background:rgba(128,128,128,.18)}
 /* 内容容器 */
 .wk-wrap{max-width:1080px;margin:14px auto;padding:0 16px}
 /* 卡片（无大圆角） */
@@ -1527,6 +1530,8 @@ async function aiAgentLoop(){
             }
           }
           aiConvMessages.push({ role:'tool', tool_call_id:t.id, name:t.name, content: resultStr, denied: denied });
+          // AI 触发/取消工作流后，同步顶部运行横幅（只显示最新一次运行）
+          try{ aiSyncBuildBanner(t.name, args, resultStr); }catch(e){}
         }
         renderAiMessages();
         continue;
@@ -2177,20 +2182,30 @@ async function onCommentAction(e){
 
 // ---------- 构建状态横幅 ----------
 let buildTimer=null;
-// 进入管理页时：若已有构建在跑，则显示进度横幅并开始轮询（此前刚发布/删除会跳到这里）
+// 工作流文件名 -> 友好名称（顶部横幅用）
+function wfLabel(run){
+  const f=String(run&&(run.workflow||'')).toLowerCase();
+  const map={'deploy.yml':'完整部署','update-gh.yml':'更新 GitHub Pages','update-cf.yml':'更新 Cloudflare Worker','clone-repo.yml':'克隆仓库','unzip.yml':'解压文件'};
+  return map[f]||(run&&(run.name||run.workflow))||'工作流';
+}
+function isBuildActive(s){ return s==='in_progress'||s==='queued'||s==='pending'||s==='waiting'; }
+// 「关闭」只针对某一次运行：更早运行的关闭记录不会影响新的运行；运行中不提供关闭按钮
+function buildDismissKey(id){ return 'bn_dismissed_'+String(id||''); }
+function isBuildDismissed(id){ try{ return !!(id&&localStorage.getItem(buildDismissKey(id))==='1'); }catch(e){ return false; } }
+function dismissBuildBanner(id){
+  try{ if(id) localStorage.setItem(buildDismissKey(id),'1'); }catch(e){}
+  hideBuildBanner();
+}
+// 进入管理页 / AI 操作工作流后：按「最近一次工作流运行」刷新横幅；运行中则显示进度并轮询
 async function initBuildStatus(){
-  const r=await api(API_BASE+'/build');
+  const r=await api(API_BASE+'/workflows/runs');
   const d=r.data||{};
   if(!r.ok||!d||!d.ok) return;
-  if(d.running){
-    showBuildBanner('部署工作流正在重建站点…');
-    pollBuild();
-    return;
-  }
-  // 非运行中：最近一次失败也保留横幅与「查看日志 / 发给 AI」入口，成功后自动清除
-  const latest=d.latest||{};
-  if(latest.conclusion && latest.conclusion!=='success') showBuildResult(latest.conclusion, latest.id);
-  else hideBuildBanner();
+  const latest=d.latest||null;
+  if(!latest){ stopBuildPoll(); hideBuildBanner(); return; }
+  if(isBuildActive(latest.status)){ showBuildBanner('「'+wfLabel(latest)+'」正在运行中…'); startBuildPoll(); return; }
+  stopBuildPoll();
+  showBuildResult(latest.conclusion, latest.id, wfLabel(latest));
 }
 function buildBannerTargets(){ return [$('#globalBuildBanner'), $('#buildBanner'), $('#buildBannerBuild')]; }
 function showBuildBanner(msg, cls){
@@ -2222,38 +2237,56 @@ async function checkAiConfigured(){
     aiConfigured = !!(d.baseUrl && d.hasKey && ((d.models&&d.models.length) || d.model));
   }catch(e){ aiConfigured=false; }
 }
-// 部署结束（成功/失败）：失败时在横幅里给出「查看日志(CF代理)」与「发给 AI」入口
-function showBuildResult(conclusion, runId){
-  const ok = conclusion==='success' || conclusion==='completed';
-  if(ok){ showBuildBanner('站点已更新完成，可以刷新首页查看','ok'); return; }
+// 终态（成功/失败）：都提供「关闭」按钮；失败另给「查看日志 / 发给 AI」。运行中不走这里（不给关闭）
+function showBuildResult(conclusion, runId, label){
   const id = runId ? String(runId) : '';
-  let html = '<span>部署工作流失败（'+esc(conclusion||'未知')+'）</span>';
-  html += '<button class="wk-btn ghost sm" onclick="showBuildLog(\\''+esc(id)+'\\')">查看日志(CF代理)</button>';
-  if(aiConfigured) html += '<button class="wk-btn ghost sm" onclick="sendBuildLogsToAi(\\''+esc(id)+'\\')">发给 AI</button>';
-  showBuildBannerHtml(html,'err');
+  const name = label || '工作流';
+  if(!conclusion){ hideBuildBanner(); return; }
+  if(isBuildDismissed(id)){ hideBuildBanner(); return; }
+  const ok = conclusion==='success' || conclusion==='completed';
+  let html = ok
+    ? '<span>「'+esc(name)+'」已完成</span>'
+    : '<span>「'+esc(name)+'」运行失败（'+esc(conclusion)+'）</span>';
+  if(!ok){
+    html += '<button class="wk-btn ghost sm" onclick="showBuildLog(\\''+esc(id)+'\\')">查看日志(CF代理)</button>';
+    if(aiConfigured) html += '<button class="wk-btn ghost sm" onclick="sendBuildLogsToAi(\\''+esc(id)+'\\')">发给 AI</button>';
+  }
+  html += '<button class="build-x" title="关闭" onclick="dismissBuildBanner(\\''+esc(id)+'\\')">×</button>';
+  showBuildBannerHtml(html, ok?'ok':'err');
 }
-function pollBuild(){
-  if(buildTimer) clearInterval(buildTimer);
+function stopBuildPoll(){ if(buildTimer){ clearInterval(buildTimer); buildTimer=null; } }
+// 运行中：每 5 秒查一次「最近一次运行」，直到本次结束
+function startBuildPoll(){
+  stopBuildPoll();
   let tries=0;
   buildTimer=setInterval(async ()=>{
     tries++;
-    const r=await api(API_BASE+'/build');
+    const r=await api(API_BASE+'/workflows/runs');
     const d=r.data||{};
-    if(!d.ok){
-      if(tries>=12){ clearInterval(buildTimer); buildTimer=null; showBuildBanner('暂时无法获取构建状态，请稍后刷新页面查看站点','err'); return; }
+    if(!r.ok||!d.ok){ if(tries>=12) stopBuildPoll(); return; }
+    const latest=d.latest||null;
+    if(!latest){ stopBuildPoll(); hideBuildBanner(); return; }
+    if(isBuildActive(latest.status)){
+      showBuildBanner('「'+wfLabel(latest)+'」正在运行中…（已等待约 '+(tries*5)+' 秒）');
       return;
     }
-    const runs=d.runs||[];
-    if(d.running){
-      showBuildBanner('部署工作流正在运行中，已等待约 '+(tries*5)+' 秒…');
-      if(tries>=24){ clearInterval(buildTimer); buildTimer=null; showBuildBanner('部署工作流仍在运行中，可稍后刷新查看',''); return; }
-      return;
-    }
-    clearInterval(buildTimer); buildTimer=null;
-    const runId=(d.latest&&d.latest.id)||(runs[0]&&runs[0].id)||'';
-    showBuildResult(d.conclusion||d.status, runId);
+    stopBuildPoll();
+    showBuildResult(latest.conclusion, latest.id, wfLabel(latest));
     const box=$('#buildHistory'); if(box) loadBuildHistory();
   }, 5000);
+}
+// AI 触发/取消工作流后同步顶部横幅：新运行要几秒才出现在接口里，先显示「运行中」再向服务端校正
+function aiSyncBuildBanner(toolName, args, resultStr){
+  if(toolName!=='trigger_build' && toolName!=='trigger_workflow' && toolName!=='cancel_workflow') return;
+  let ok=true;
+  try{ ok = JSON.parse(String(resultStr||'{}')).ok !== false; }catch(e){ ok=true; }
+  if(!ok){ setTimeout(function(){ initBuildStatus(); }, 1500); return; }
+  if(toolName==='cancel_workflow'){ setTimeout(function(){ initBuildStatus(); }, 2500); return; }
+  const wid=String((args&&(args.workflow_id||args.workflow))||'').trim();
+  const label = toolName==='trigger_build' ? '完整部署' : wfLabel({workflow:wid.toLowerCase().split('/').pop()});
+  showBuildBanner('「'+label+'」正在运行中…');
+  stopBuildPoll();
+  setTimeout(function(){ initBuildStatus(); }, 4000);
 }
 
 // ---------- 手动运行工作流 + 部署记录 ----------
@@ -2269,9 +2302,9 @@ async function triggerBuild(){
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.ok){
     toast('已触发部署工作流，稍候开始构建');
-    showBuildBanner('已触发部署工作流，正在重建站点…');
-    // 触发后 run 需几秒才出现，稍作延迟后开始轮询与刷新历史
-    setTimeout(pollBuild, 3000);
+    showBuildBanner('「完整部署」正在运行中…');
+    // 触发后 run 需几秒才出现，稍作延迟后按「最近一次运行」校正横幅状态与刷新历史
+    setTimeout(()=>{ initBuildStatus(); }, 3000);
     setTimeout(()=>{ const box=$('#buildHistory'); if(box) loadBuildHistory(); }, 4000);
   } else {
     toast('触发失败：'+(r.data&&r.data.error||r.status),true);
