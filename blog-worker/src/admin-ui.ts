@@ -47,6 +47,11 @@ a{color:var(--accent);text-decoration:none}
 /* 横幅右侧「关闭」按钮（仅终态成功/失败提供，运行中不给） */
 .build-x{margin-left:auto;border:0;background:transparent;color:inherit;opacity:.6;font-size:16px;line-height:1;cursor:pointer;padding:2px 7px;border-radius:4px}
 .build-x:hover{opacity:1;background:rgba(128,128,128,.18)}
+/* 顶部展示「所有正在运行的工作流」的条目标签 */
+.build-run-item{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:3px;background:rgba(251,191,36,.16);color:#8a6d00;font-weight:500}
+.build-dot{width:7px;height:7px;border-radius:50%;background:#f59e0b;flex:0 0 auto;animation:buildPulse 1.2s ease-in-out infinite}
+@keyframes buildPulse{0%,100%{opacity:1}50%{opacity:.2}}
+@media(prefers-color-scheme:dark){.build-run-item{color:#fbbf24;background:rgba(251,191,36,.12)}}
 /* 内容容器 */
 .wk-wrap{max-width:1080px;margin:14px auto;padding:0 16px}
 /* 卡片（无大圆角） */
@@ -246,6 +251,10 @@ a{color:var(--accent);text-decoration:none}
 .ai-usage-row b{color:var(--fg);font-weight:600}
 .ai-usage-empty{color:var(--muted);max-width:210px;line-height:1.6}
 .ai-input{display:flex;gap:8px;align-items:flex-end;padding:8px 14px 12px;flex-shrink:0}
+/* 「继续未完成回复」提示条：打开未跑完的历史会话时出现 */
+.ai-continue{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding:7px 10px;font-size:12px;border:1px solid var(--border);border-radius:3px;background:rgba(251,191,36,.14);color:#8a6d00}
+.ai-continue span{flex:1 1 auto}
+@media(prefers-color-scheme:dark){.ai-continue{color:#fbbf24;background:rgba(251,191,36,.12)}}
 /* 输入框不显示拖拽手柄：随内容自动向上增高（到上限后内部滚动） */
 .ai-input textarea{flex:1;resize:none;min-height:34px;max-height:220px;overflow-y:hidden;border-radius:2px}
 /* 生成中：发送键原地变成灰色「停止」 */
@@ -385,7 +394,7 @@ function go(name){
     if(name==='manage'){ loadPosts(); initBuildStatus(); }
     if(name==='comments') loadComments();
     if(name==='files'){ loadFiles(); resumeUnzipStatus(); }
-    if(name==='build') loadBuildHistory();
+    if(name==='build'){ loadBuildWorkflows(); loadBuildHistory(); }
     if(name==='visit') loadVisit();
     if(name==='subscribe') loadSubscribe();
     if(name==='ai'){ loadAiChat(); aiFitHeight(); }
@@ -1143,7 +1152,7 @@ function aiFoldAttr(key, defOpen){
 }
 function renderAiMessages(){
   const box = $('#aiCol'); if(!box) return;
-  if(!aiConvMessages.length){ box.innerHTML = '<div class="empty">开始和 AI 对话吧</div>'; return; }
+  if(!aiConvMessages.length){ box.innerHTML = '<div class="empty">开始和 AI 对话吧</div>'; aiUpdateContinueBar(); return; }
   let html = '';
   let i = 0;
   while(i < aiConvMessages.length){
@@ -1158,6 +1167,7 @@ function renderAiMessages(){
   }
   box.innerHTML = html;
   aiBindFolds(box);
+  aiUpdateContinueBar();
   scrollAiBottom();
 }
 // 撤回：删除该条及其之后的消息，并把该条内容放回输入框
@@ -1441,6 +1451,7 @@ async function aiSend(){
   if(input){ input.value = ''; aiAutoGrow(); }
   aiSetTitle(aiConvTitle);
   renderAiMessages();
+  aiSaveProgress();   // 先落盘用户提问，刷新后不会整轮消失
   await aiAgentLoop();
 }
 // 是否需要用户确认：full 不确认；important 仅危险操作确认；all/其他 全部确认
@@ -1480,8 +1491,8 @@ async function aiAgentLoop(){
       }catch(e){
         if(e && e.name === 'AbortError'){
           if(msg){ msg.className = 'msg'; msg.textContent = '已停止生成'; }
-          // 停止时保留已生成的部分内容，重渲染后仍可见
-          if(ui.acc){ aiConvMessages.push({ role:'assistant', content: ui.acc }); }
+          // 停止时保留已生成的部分内容（草稿已落盘，这里转正），重渲染后仍可见
+          if(ui.acc){ if(!aiFinalizeDraft(ui.acc)) aiConvMessages.push({ role:'assistant', content: ui.acc }); }
           finished = true;
           break;
         }
@@ -1489,8 +1500,8 @@ async function aiAgentLoop(){
         const hint = aiChatProxyOn() ? '（前端代理请求失败：服务商可能不允许跨域）' : '';
         if(msg){ msg.className = 'msg err'; msg.textContent = '请求失败：' + err + hint; }
         toast('请求失败：' + err, true);
-        // 保留已收到的部分内容，并清掉临时气泡（否则会残留「等待模型响应」）
-        if(ui.acc){ aiConvMessages.push({ role:'assistant', content: ui.acc }); }
+        // 保留已收到的部分内容（草稿转正），并清掉临时气泡（否则会残留「等待模型响应」）
+        if(ui.acc){ if(!aiFinalizeDraft(ui.acc)) aiConvMessages.push({ role:'assistant', content: ui.acc }); }
         finished = true;
         break;
       }
@@ -1503,10 +1514,12 @@ async function aiAgentLoop(){
         if(aiThink && res.reasoning) am.reasoning = res.reasoning;
         if(res.usage) am.usage = res.usage;
         if(res.perf) am.perf = res.perf;
+        aiDropDraft(); // 本轮流式草稿并入下面的正式消息，避免重复
         aiConvMessages.push(am);
         aiUsagePending = null; aiPerfPending = null; // 已并入消息，避免重复累计
         renderAiMessages();
         aiUpdateUsagePop();
+        aiSaveProgress(); // 工具调用这一步先落盘，刷新后不丢进度
         for(let k=0; k<res.toolCalls.length; k++){
           const t = res.toolCalls[k];
           let args = {};
@@ -1530,7 +1543,8 @@ async function aiAgentLoop(){
             }
           }
           aiConvMessages.push({ role:'tool', tool_call_id:t.id, name:t.name, content: resultStr, denied: denied });
-          // AI 触发/取消工作流后，同步顶部运行横幅（只显示最新一次运行）
+          aiSaveProgress(); // 每个工具结果落盘，刷新后能看到已执行到哪一步
+          // AI 触发/取消工作流后，同步顶部运行横幅（会聚合展示所有正在运行的工作流）
           try{ aiSyncBuildBanner(t.name, args, resultStr); }catch(e){}
         }
         renderAiMessages();
@@ -1540,6 +1554,7 @@ async function aiAgentLoop(){
       if(aiThink && res.reasoning) fm.reasoning = res.reasoning;
       if(res.usage) fm.usage = res.usage;
       if(res.perf) fm.perf = res.perf;
+      aiDropDraft(); // 草稿内容已包含在最终回答里
       aiConvMessages.push(fm);
       aiUsagePending = null; aiPerfPending = null;
       finished = true;
@@ -1551,15 +1566,16 @@ async function aiAgentLoop(){
     aiUpdateUsagePop();
     // 生成结束（非中断/异常）后重渲染一次：恢复「AI」标签与「复制」按钮
     if(finished) renderAiMessages();
+    else aiUpdateContinueBar(); // 中断/异常：如仍有未完成步骤，提示可「继续」
   }
   await aiSaveConversation();
   scrollAiBottom();
 }
-// 清理历史消息：去掉仅供前端展示的字段（思考/拒绝/用量），避免上游接口报错
+// 清理历史消息：去掉仅供前端展示的字段（思考/拒绝/用量/草稿标记），避免上游接口报错
 function aiCleanMsg(m){
-  if(!m || (m.reasoning === undefined && m.denied === undefined && m.usage === undefined && m.perf === undefined)) return m;
+  if(!m || (m.reasoning === undefined && m.denied === undefined && m.usage === undefined && m.perf === undefined && m.draft === undefined)) return m;
   const c = {};
-  for(const k in m){ if(k !== 'reasoning' && k !== 'denied' && k !== 'usage' && k !== 'perf') c[k] = m[k]; }
+  for(const k in m){ if(k !== 'reasoning' && k !== 'denied' && k !== 'usage' && k !== 'perf' && k !== 'draft') c[k] = m[k]; }
   return c;
 }
 // 流式请求一轮，返回 {content, toolCalls, reasoning, usage}
@@ -1650,6 +1666,9 @@ async function aiStreamRound(modelName, ui, noTools){
         acc += delta.content;
         markFirst();
         if(ui) ui.acc = acc; // 暴露给调用方，停止时可保留部分内容
+        // 把已生成的部分作为草稿写入会话并节流落盘：刷新后仍能看到「进行到哪一步」
+        aiSetDraft(acc);
+        aiSaveProgress();
         const now = Date.now();
         if(ui && ui.bodyEl && (now - lastPaint > 80)){ lastPaint = now; ui.bodyEl.innerHTML = renderMd(acc); scrollAiBottom(); }
       }
@@ -1763,6 +1782,64 @@ async function aiSaveConversation(){
   });
   if(r.ok && r.data && r.data.id){ aiConvId = r.data.id; aiSyncUrl(); loadAiConversations(); }
 }
+
+// ---------- 生成过程持久化：刷新/关闭页面后仍能看到「进行到哪一步」并继续 ----------
+let aiProgressTimer=null, aiProgressLast=0, aiProgressBusy=false;
+// 静默保存（不刷新会话列表，避免生成中频繁重排）；同一时刻只允许一个写请求，避免新建出重复会话
+async function aiSaveProgressNow(){
+  if(aiProgressBusy) return;
+  if(!aiConvMessages.length && !aiConvId) return;
+  aiProgressBusy=true;
+  try{
+    const firstUser = aiConvMessages.find(function(m){ return m.role==='user'; });
+    const title = (aiConvTitle || (firstUser ? String(firstUser.content||'').slice(0,30) : '新对话')).slice(0,100);
+    const r = await api('/admin/api/ai/conversation', { method:'PUT', body: JSON.stringify({ id: aiConvId, title: title, messages: aiConvMessages }) });
+    if(r.ok && r.data && r.data.id){
+      if(!aiConvId){ aiConvId=r.data.id; aiSyncUrl(); loadAiConversations(); }
+    }
+  }catch(e){}finally{ aiProgressBusy=false; }
+}
+// 节流：最多每 1.2 秒落盘一次，避免流式输出时打爆接口
+function aiSaveProgress(){
+  const now=Date.now();
+  if(now - aiProgressLast >= 1200){ aiProgressLast=now; aiSaveProgressNow(); return; }
+  if(!aiProgressTimer){ aiProgressTimer=setTimeout(function(){ aiProgressTimer=null; aiProgressLast=Date.now(); aiSaveProgressNow(); }, 1200); }
+}
+// 流式输出中的草稿消息：内容随输出增长，随会话一起落盘，页面被刷新后仍能看到已生成的部分
+function aiSetDraft(text){
+  if(!text) return;
+  let d=aiConvMessages[aiConvMessages.length-1];
+  if(!d || !d.draft){ d={ role:'assistant', content:'', draft:true }; aiConvMessages.push(d); }
+  d.content=text;
+}
+function aiDropDraft(){ const d=aiConvMessages[aiConvMessages.length-1]; if(d && d.draft) aiConvMessages.pop(); }
+function aiFinalizeDraft(content){
+  const d=aiConvMessages[aiConvMessages.length-1];
+  if(d && d.draft){ if(content!==undefined) d.content=content; delete d.draft; return true; }
+  return false;
+}
+// 上一轮是否「没跑完」：只问了没答 / 有工具调用但缺结果 / 收尾却在工具结果处 / 留下流式草稿
+function aiTurnIncomplete(){
+  if(!aiConvMessages.length) return false;
+  const last=aiConvMessages[aiConvMessages.length-1]||{};
+  if(last.role==='user') return true;
+  if(last.draft) return true;
+  if(last.role==='tool') return true;
+  if(last.role==='assistant' && last.tool_calls && last.tool_calls.length) return true;
+  return false;
+}
+function aiContinue(){
+  if(aiStreaming) return;
+  const i=$('#aiInput');
+  if(i){ i.value='继续'; aiAutoGrow(); i.focus(); }
+  aiSend();
+}
+// 「继续未完成回复」提示条：打开历史会话时若上一轮没跑完（被刷新/中断），提示可一键继续
+function aiUpdateContinueBar(){
+  const bar=$('#aiContinueBar'); if(!bar) return;
+  bar.classList.toggle('hidden', aiStreaming || !aiTurnIncomplete());
+}
+function aiDismissContinue(){ const bar=$('#aiContinueBar'); if(bar) bar.classList.add('hidden'); }
 
 // ---------- AI 密钥（占位符 {name}，仅存名称，值不下发）----------
 async function loadSecrets(){
@@ -2196,27 +2273,40 @@ function dismissBuildBanner(id){
   try{ if(id) localStorage.setItem(buildDismissKey(id),'1'); }catch(e){}
   hideBuildBanner();
 }
-// 进入管理页 / AI 操作工作流后：按「最近一次工作流运行」刷新横幅；运行中则显示进度并轮询
+// 进入管理页 / AI 操作工作流后：按「所有正在运行的工作流」刷新横幅；无运行中则显示最近一次结果
 async function initBuildStatus(){
-  const r=await api(API_BASE+'/workflows/runs');
+  const r=await api(API_BASE+'/workflows/runs?limit=30');
   const d=r.data||{};
   if(!r.ok||!d||!d.ok) return;
-  const latest=d.latest||null;
-  if(!latest){ stopBuildPoll(); hideBuildBanner(); return; }
-  if(isBuildActive(latest.status)){ showBuildBanner('「'+wfLabel(latest)+'」正在运行中…'); startBuildPoll(); return; }
+  const runs=d.runs||[];
+  if(activeRuns(runs).length){ showRunningBanner(runs); startBuildPoll(); return; }
   stopBuildPoll();
+  const latest=d.latest||null;
+  if(!latest){ hideBuildBanner(); return; }
   showBuildResult(latest.conclusion, latest.id, wfLabel(latest));
 }
-function buildBannerTargets(){ return [$('#globalBuildBanner'), $('#buildBanner'), $('#buildBannerBuild')]; }
-function showBuildBanner(msg, cls){
-  buildBannerTargets().forEach((b)=>{
-    if(!b) return;
-    b.className='build-banner '+(cls||'');
-    b.textContent=msg;
-    b.classList.remove('hidden');
-  });
+// 当前所有处于运行/排队状态的工作流（可能同时跑多个，如克隆 + 更新 GitHub）
+function activeRuns(runs){
+  return (runs||[]).filter(function(r){ return isBuildActive(r.status); });
 }
-// 允许横幅里放按钮（如失败时的「查看日志 / 发给 AI」）
+// 在横幅里列出「所有正在运行的工作流」；同名工作流合并计数；运行中不给关闭按钮
+function showRunningBanner(runs, extra){
+  const act=activeRuns(runs);
+  if(!act.length) return false;
+  const counts={}, order=[];
+  act.forEach(function(r){
+    const lb=wfLabel(r);
+    if(!counts[lb]){ counts[lb]=0; order.push(lb); }
+    counts[lb]++;
+  });
+  const html=order.map(function(lb){
+    return '<span class="build-run-item"><span class="build-dot"></span>正在运行「'+esc(lb)+'」工作流'+(counts[lb]>1?(' ×'+counts[lb]):'')+'…</span>';
+  }).join('');
+  showBuildBannerHtml(html+(extra?('<span style="color:var(--muted)">'+esc(extra)+'</span>'):''), '');
+  return true;
+}
+function buildBannerTargets(){ return [$('#globalBuildBanner'), $('#buildBanner'), $('#buildBannerBuild')]; }
+// 允许横幅里放按钮/多个条目（运行中列出所有工作流；失败时提供「查看日志 / 发给 AI」）
 function showBuildBannerHtml(html, cls){
   buildBannerTargets().forEach((b)=>{
     if(!b) return;
@@ -2255,22 +2345,20 @@ function showBuildResult(conclusion, runId, label){
   showBuildBannerHtml(html, ok?'ok':'err');
 }
 function stopBuildPoll(){ if(buildTimer){ clearInterval(buildTimer); buildTimer=null; } }
-// 运行中：每 5 秒查一次「最近一次运行」，直到本次结束
+// 运行中：每 5 秒查一次「所有正在运行的工作流」，直到全部结束
 function startBuildPoll(){
   stopBuildPoll();
   let tries=0;
   buildTimer=setInterval(async ()=>{
     tries++;
-    const r=await api(API_BASE+'/workflows/runs');
+    const r=await api(API_BASE+'/workflows/runs?limit=30');
     const d=r.data||{};
     if(!r.ok||!d.ok){ if(tries>=12) stopBuildPoll(); return; }
-    const latest=d.latest||null;
-    if(!latest){ stopBuildPoll(); hideBuildBanner(); return; }
-    if(isBuildActive(latest.status)){
-      showBuildBanner('「'+wfLabel(latest)+'」正在运行中…（已等待约 '+(tries*5)+' 秒）');
-      return;
-    }
+    const runs=d.runs||[];
+    if(activeRuns(runs).length){ showRunningBanner(runs, '（已等待约 '+(tries*5)+' 秒）'); return; }
     stopBuildPoll();
+    const latest=d.latest||null;
+    if(!latest){ hideBuildBanner(); return; }
     showBuildResult(latest.conclusion, latest.id, wfLabel(latest));
     const box=$('#buildHistory'); if(box) loadBuildHistory();
   }, 5000);
@@ -2284,7 +2372,8 @@ function aiSyncBuildBanner(toolName, args, resultStr){
   if(toolName==='cancel_workflow'){ setTimeout(function(){ initBuildStatus(); }, 2500); return; }
   const wid=String((args&&(args.workflow_id||args.workflow))||'').trim();
   const label = toolName==='trigger_build' ? '完整部署' : wfLabel({workflow:wid.toLowerCase().split('/').pop()});
-  showBuildBanner('「'+label+'」正在运行中…');
+  // 新运行要几秒才出现在接口里：先乐观显示「正在运行该工作流」，再由服务端聚合出所有运行中的工作流
+  showBuildBannerHtml('<span class="build-run-item"><span class="build-dot"></span>正在运行「'+esc(label)+'」工作流…</span>');
   stopBuildPoll();
   setTimeout(function(){ initBuildStatus(); }, 4000);
 }
@@ -2302,7 +2391,7 @@ async function triggerBuild(){
   if(r.status===401){ redirectLogin(); return; }
   if(r.ok&&r.data&&r.data.ok){
     toast('已触发部署工作流，稍候开始构建');
-    showBuildBanner('「完整部署」正在运行中…');
+    showBuildBannerHtml('<span class="build-run-item"><span class="build-dot"></span>正在运行「完整部署」工作流…</span>');
     // 触发后 run 需几秒才出现，稍作延迟后按「最近一次运行」校正横幅状态与刷新历史
     setTimeout(()=>{ initBuildStatus(); }, 3000);
     setTimeout(()=>{ const box=$('#buildHistory'); if(box) loadBuildHistory(); }, 4000);
@@ -2319,20 +2408,39 @@ function buildBadge(status, conclusion){
   if(status==='completed') return '<span class="wk-badge wait">'+(conclusion||'结束')+'</span>';
   return '<span class="wk-badge running">运行中</span>';
 }
+// 运行记录：下拉列出仓库里的所有工作流，用于切换查看不同工作流的记录
+async function loadBuildWorkflows(){
+  const sel=$('#buildHistoryWf'); if(!sel) return;
+  const cur=sel.value;
+  const r=await api(API_BASE+'/workflows');
+  const list=(r.ok&&r.data&&r.data.workflows)||[];
+  let html='<option value="">全部工作流</option>';
+  list.forEach(function(w){
+    const f=w.file||'';
+    if(!f) return;
+    html+='<option value="'+esc(f)+'">'+esc(wfLabel({workflow:f,name:w.name}))+'</option>';
+  });
+  sel.innerHTML=html;
+  sel.value=cur;
+}
 async function loadBuildHistory(){
   const box=$('#buildHistory'); if(!box) return;
+  const sel=$('#buildHistoryWf');
+  const wf=sel?sel.value:'';
+  if(sel && sel.options.length <= 1) await loadBuildWorkflows();
   box.innerHTML='<div class="empty">加载中...</div>';
-  const r=await api(API_BASE+'/build/history');
+  const r=await api(API_BASE+'/workflows/runs?limit=20'+(wf?('&workflow='+encodeURIComponent(wf)):''));
   if(r.status===401){ redirectLogin(); return; }
-  if(!r.ok){ box.innerHTML='<div class="empty">加载失败：'+(r.data&&r.data.error||r.status)+'</div>'; return; }
+  if(!r.ok||!r.data||!r.data.ok){ box.innerHTML='<div class="empty">加载失败：'+(r.data&&r.data.error||r.status)+'</div>'; return; }
   const runs=r.data.runs||[];
-  if(!runs.length){ box.innerHTML='<div class="empty">暂无部署记录</div>'; return; }
-  let html='<table class="wk-build-table"><thead><tr><th>#</th><th>时间</th><th>提交</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+  if(!runs.length){ box.innerHTML='<div class="empty">暂无运行记录</div>'; return; }
+  let html='<table class="wk-build-table"><thead><tr><th>#</th><th>工作流</th><th>时间</th><th>提交</th><th>状态</th><th>操作</th></tr></thead><tbody>';
   runs.forEach(rn=>{
     const t=rn.created_at?new Date(rn.created_at).toLocaleString('zh-CN',{hour12:false}):'';
     const id=esc(rn.id);
     html+='<tr><td><a href="'+esc(rn.html_url)+'" target="_blank" rel="noopener">#'+id+'</a></td>'+
-      '<td>'+esc(t)+'</td><td><code>'+esc(rn.head_sha)+'</code></td>'+
+      '<td>'+esc(wfLabel(rn))+'</td>'+
+      '<td>'+esc(t)+'</td><td><code>'+esc(rn.head_sha||'-')+'</code></td>'+
       '<td>'+buildBadge(rn.status,rn.conclusion)+'</td>'+
       '<td style="white-space:nowrap">'+
         '<a class="wk-btn ghost sm" href="'+esc(rn.html_url)+'" target="_blank" rel="noopener" title="在 GitHub 打开">↗</a> '+
@@ -3046,10 +3154,16 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
     <div id="buildBannerBuild" class="build-banner hidden" style="margin-bottom:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap"></div>
     <div class="wk-card">
       <div class="toolbar" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
-        <h3 class="wk-title" style="margin:0;border:none;padding:0">部署记录</h3>
-        <button class="wk-btn act sm" onclick="triggerBuild()">▶ 手动运行工作流</button>
+        <h3 class="wk-title" style="margin:0;border:none;padding:0">工作流运行记录</h3>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <select class="wk-input" id="buildHistoryWf" onchange="loadBuildHistory()" title="切换要查看的工作流" style="width:auto;min-width:150px;padding:4px 8px">
+            <option value="">全部工作流</option>
+          </select>
+          <button class="wk-btn ghost sm" onclick="loadBuildHistory()">刷新</button>
+          <button class="wk-btn act sm" onclick="triggerBuild()">▶ 运行完整部署</button>
+        </div>
       </div>
-      <p class="wk-label" style="margin-top:0">改完文件后点「运行工作流」即可手动触发部署，无需推送代码。点击「查看日志」可跳转 GitHub Actions 查看完整构建日志。</p>
+      <p class="wk-label" style="margin-top:0">下拉可切换查看不同工作流（完整部署 / 更新 GitHub Pages / 克隆仓库 等）的运行记录；点「查看日志」经 Cloudflare 代理直接看日志，无需跳转 GitHub。</p>
       <div class="table-scroll"><div id="buildHistory" class="empty">加载中...</div></div>
     </div>
   </div>
@@ -3151,6 +3265,11 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
           </div>
         </div>
         <div id="aiMessages" class="ai-scroll"><div class="ai-col" id="aiCol"><div class="empty">开始和 AI 对话吧</div></div></div>
+        <div class="ai-continue hidden" id="aiContinueBar" style="margin:0 14px">
+          <span>这次回复未完成（可能因刷新 / 中断），可从断点继续。</span>
+          <button class="wk-btn sm" onclick="aiContinue()">继续</button>
+          <button class="wk-btn ghost sm" onclick="aiDismissContinue()">忽略</button>
+        </div>
         <div class="msg" id="aiChatMsg" style="margin:0 14px"></div>
         <div class="ai-foot">
           <span class="wk-label" style="margin:0">模型</span>

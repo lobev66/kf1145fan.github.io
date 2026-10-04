@@ -378,7 +378,7 @@ app.get("/admin/api/workflows", async (c) => {
 
 app.get("/admin/api/workflows/runs", async (c) => {
   if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
-  return handleWorkflowRuns(c.env as Bindings, c.req.query("workflow") || "");
+  return handleWorkflowRuns(c.env as Bindings, c.req.query("workflow") || "", Number(c.req.query("limit") || 20));
 });
 
 app.post("/admin/api/workflows/trigger", async (c) => {
@@ -2688,14 +2688,15 @@ async function handleListWorkflows(env: Bindings): Promise<Response> {
 }
 
 // 查询工作流运行记录（workflow 为文件名，省略则查全部）
-async function handleWorkflowRuns(env: Bindings, workflow: string): Promise<Response> {
+async function handleWorkflowRuns(env: Bindings, workflow: string, limit = 20): Promise<Response> {
   const { token, repo, headers } = ghConfig(env);
   if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
   const wf = String(workflow || "").trim();
+  const n = Math.min(Math.max(Number(limit) || 20, 1), 50);
   try {
     const url = wf
-      ? `https://api.github.com/repos/${repo}/actions/workflows/${encodeURIComponent(wf)}/runs?per_page=5`
-      : `https://api.github.com/repos/${repo}/actions/runs?per_page=10`;
+      ? `https://api.github.com/repos/${repo}/actions/workflows/${encodeURIComponent(wf)}/runs?per_page=${n}`
+      : `https://api.github.com/repos/${repo}/actions/runs?per_page=${n}`;
     const res = await fetch(url, { headers });
     if (!res.ok) return json({ ok: false, error: "github error " + res.status }, 502);
     const data = (await res.json()) as any;
@@ -2706,6 +2707,7 @@ async function handleWorkflowRuns(env: Bindings, workflow: string): Promise<Resp
       status: r.status,
       conclusion: r.conclusion || "",
       created_at: r.created_at || "",
+      head_sha: (r.head_sha || "").slice(0, 7),
       html_url: r.html_url || "",
     }));
     const running = runs.some((r: any) => GH_ACTIVE_STATES.indexOf(r.status) >= 0);
