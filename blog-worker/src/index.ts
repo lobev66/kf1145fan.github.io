@@ -2234,6 +2234,17 @@ app.post("/admin/api/files/purge", async (c) => {
   return json(await handlePurgePaths(c.env as Bindings, body.paths, body.branch));
 });
 
+// 重命名 / 移动文件或目录（目录整体一次提交）
+app.post("/admin/api/files/move", async (c) => {
+  if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
+  const body = (await c.req.json().catch(() => ({}))) as { from?: unknown; to?: unknown; branch?: unknown };
+  const from = String(body.from || "").trim().replace(/^\/+|\/+$/g, "");
+  const to = String(body.to || "").trim().replace(/^\/+|\/+$/g, "");
+  if (!from || !to) return json({ ok: false, error: "from/to required" }, 400);
+  const branch = String(body.branch || "").trim() || ghConfig(c.env as Bindings).branch;
+  return json(await movePath(c.env as Bindings, from, to, branch));
+});
+
 app.post("/admin/api/upload", async (c) => {
   if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
   return handleUploadFile(c.env as Bindings, c.req.raw);

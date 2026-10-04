@@ -13,6 +13,14 @@ const VDIRTOR_JS = "https://cdn.jsdelivr.net/npm/vditor@3.11.1/dist/index.min.js
 // AI 消息 Markdown 渲染：使用完整的 GFM 解析器（支持表格、任务列表、删除线等），并用 DOMPurify 防 XSS
 const MARKED_JS = "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js";
 const DOMPURIFY_JS = "https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js";
+// 文件编辑器语法高亮：CodeMirror 5（MIT，按需懒加载，不拖慢其它页面）
+const CM_BASE = "https://cdn.jsdelivr.net/npm/codemirror@5.65.16";
+const CM_CSS = CM_BASE + "/lib/codemirror.min.css";
+const CM_THEME_DARK = CM_BASE + "/theme/material-darker.min.css";
+const CM_JS = CM_BASE + "/lib/codemirror.min.js";
+const CM_MODES = ["javascript", "css", "xml", "markdown", "python", "shell", "yaml", "sql", "clike", "go"].map(
+  (m) => CM_BASE + "/mode/" + m + "/" + m + ".min.js",
+);
 
 const STYLE = `
 :root{color-scheme:light dark;--accent:#f97316;--accent-h:#ea580c;
@@ -312,6 +320,9 @@ a{color:var(--accent);text-decoration:none}
 #aiChatModel{max-width:34vw!important}
 .ai-input{padding:6px 10px calc(6px + env(safe-area-inset-bottom))}
 }
+/* 文件编辑器：CodeMirror 填满剩余高度，跟随主题 */
+#fileEditor .CodeMirror{flex:1;height:auto;min-height:0;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+#fileEditor .CodeMirror-scroll{padding:6px 0}
 `;
 
 const SCRIPT = `
@@ -2336,7 +2347,8 @@ function showRunningBanner(runs, extra){
   showBuildBannerHtml(html+(extra?('<span style="color:var(--muted)">'+esc(extra)+'</span>'):''), '');
   return true;
 }
-function buildBannerTargets(){ return [$('#globalBuildBanner'), $('#buildBanner'), $('#buildBannerBuild')]; }
+// 只渲染顶部那一处横幅：此前同时写入页内横幅，导致同一状态被显示两遍（运行中会出现两条/四条）
+function buildBannerTargets(){ return [$('#globalBuildBanner')]; }
 // 允许横幅里放按钮/多个条目（运行中列出所有工作流；失败时提供「查看日志 / 发给 AI」）
 function showBuildBannerHtml(html, cls){
   buildBannerTargets().forEach((b)=>{
@@ -2457,6 +2469,26 @@ async function triggerBuild(){
     if(r.data&&r.data.detail) toast(r.data.detail,true);
   }
 }
+// 运行「部署记录」页所选的工作流（workflow_dispatch）
+async function triggerSelectedWorkflow(){
+  const sel=$('#buildRunWf'); if(!sel) return;
+  if(sel.options.length<=1) await loadBuildWorkflows();
+  const wid=sel.value;
+  if(!wid){ toast('请先选择要运行的工作流',true); return; }
+  const label=wfLabel({workflow:wid});
+  if(!confirm('确定运行「'+label+'」工作流吗？')) return;
+  const r=await api(API_BASE+'/workflows/trigger',{method:'POST',body:JSON.stringify({workflow_id:wid})});
+  if(r.status===401){ redirectLogin(); return; }
+  if(r.ok&&r.data&&r.data.ok){
+    toast('已触发「'+label+'」工作流');
+    showBuildBannerHtml('<span class="build-run-item"><span class="build-dot"></span>正在运行「'+esc(label)+'」工作流…</span>');
+    setTimeout(function(){ initBuildStatus(); }, 3000);
+    setTimeout(function(){ loadBuildHistory(); }, 4000);
+  } else {
+    toast('触发失败：'+(r.data&&r.data.error||r.status),true);
+    if(r.data&&r.data.detail) toast(r.data.detail,true);
+  }
+}
 function buildBadge(status, conclusion){
   if(conclusion==='success') return '<span class="wk-badge success">成功</span>';
   if(conclusion==='failure') return '<span class="wk-badge fail">失败</span>';
@@ -2467,18 +2499,17 @@ function buildBadge(status, conclusion){
 }
 // 运行记录：下拉列出仓库里的所有工作流，用于切换查看不同工作流的记录
 async function loadBuildWorkflows(){
-  const sel=$('#buildHistoryWf'); if(!sel) return;
-  const cur=sel.value;
+  const sel=$('#buildHistoryWf'), runSel=$('#buildRunWf');
+  if(!sel && !runSel) return;
+  const cur=sel?sel.value:'';
+  const curRun=runSel?runSel.value:'';
   const r=await api(API_BASE+'/workflows');
   const list=(r.ok&&r.data&&r.data.workflows)||[];
-  let html='<option value="">全部工作流</option>';
-  list.forEach(function(w){
-    const f=w.file||'';
-    if(!f) return;
-    html+='<option value="'+esc(f)+'">'+esc(wfLabel({workflow:f,name:w.name}))+'</option>';
-  });
-  sel.innerHTML=html;
-  sel.value=cur;
+  const opts=list.filter(function(w){ return !!w.file; }).map(function(w){
+    return '<option value="'+esc(w.file)+'">'+esc(wfLabel({workflow:w.file,name:w.name}))+'</option>';
+  }).join('');
+  if(sel){ sel.innerHTML='<option value="">全部工作流</option>'+opts; sel.value=cur; }
+  if(runSel){ runSel.innerHTML='<option value="">选择要运行的工作流…</option>'+opts; runSel.value=curRun; }
 }
 async function loadBuildHistory(){
   const box=$('#buildHistory'); if(!box) return;
@@ -2648,9 +2679,11 @@ async function loadFiles(){
           '<button class="wk-btn danger sm" data-a="purge">彻底删除</button>';
       if(!isDir) ops='<button class="wk-btn ghost sm" data-a="dl">下载</button>'+ops;
     } else if(isDir){
-      ops='<button class="wk-btn danger sm" data-a="del">删除</button>';
+      ops='<button class="wk-btn ghost sm" data-a="rename">重命名</button>'+
+          '<button class="wk-btn danger sm" data-a="del">删除</button>';
     } else {
       ops='<button class="wk-btn ghost sm" data-a="edit">编辑</button>'+
+          '<button class="wk-btn ghost sm" data-a="rename">重命名</button>'+
           '<button class="wk-btn ghost sm" data-a="dl">下载</button>'+
           '<button class="wk-btn danger sm" data-a="del">删除</button>';
       if(isZip) ops='<button class="wk-btn act sm" data-a="zip">解压</button>'+ops;
@@ -2757,10 +2790,20 @@ async function onFileClick(e){
     if(!r.ok){ toast('读取失败：'+(r.data&&r.data.error||r.status),true); return; }
     const d=r.data||{};
     if(d.binary){ toast('二进制文件暂不支持在线编辑，请下载后修改再上传',true); return; }
-    fileEditPath=path;
-    $('#fileEditPath').textContent=path;
-    $('#fileEditArea').value=d.content||'';
-    $('#fileEditor').classList.remove('hidden');
+    cmEnsure(function(){ openFileEditor(path, d.content||''); });
+    return;
+  }
+  if(a==='rename'){
+    const nw=prompt('重命名「'+name+'」为：', name);
+    if(!nw||!nw.trim()||nw.trim()===name) return;
+    const cut=path.lastIndexOf('/');
+    const to=(cut>=0?path.slice(0,cut+1):'')+nw.trim();
+    opBanner('正在重命名「'+name+'」…','busy');
+    const r=await api(API_BASE+'/files/move',{method:'POST',body:JSON.stringify({from:path,to:to,branch:curBranch()})});
+    if(r.status===401){ redirectLogin(); return; }
+    if(r.ok&&r.data&&r.data.ok) opBannerEnd('已重命名为「'+String(r.data.moved||to).split('/').pop()+'」',true);
+    else opBannerEnd('重命名失败：'+(r.data&&r.data.error||r.status),false);
+    loadFiles();
     return;
   }
   if(a==='dl'){
@@ -2778,8 +2821,63 @@ async function onFileListClick(e){
   filePath=li.dataset.path;
   loadFiles();
 }
+// ---------- 文件编辑器：CodeMirror 懒加载 + 语法高亮 ----------
+let cmReady=false, cmWaiters=[], fileEditorCM=null;
+// 首次打开编辑器时按需加载 CodeMirror（含主题与常用语言模式），不加载就不影响其它页面
+function cmEnsure(cb){
+  if(cmReady){ cb(); return; }
+  cmWaiters.push(cb);
+  if(cmWaiters.length>1) return; // 已在加载中，排队等待
+  [CM_CSS, CM_THEME_DARK].forEach(function(u){
+    const l=document.createElement('link'); l.rel='stylesheet'; l.href=u; document.head.appendChild(l);
+  });
+  const urls=[CM_JS].concat(CM_MODES);
+  let i=0;
+  const next=function(){
+    if(i>=urls.length){ cmReady=true; const ws=cmWaiters; cmWaiters=[]; ws.forEach(function(f){ try{ f(); }catch(e){} }); return; }
+    const sc=document.createElement('script'); sc.src=urls[i++]; sc.onload=next; sc.onerror=next; document.head.appendChild(sc);
+  };
+  next();
+}
+// 扩展名 -> CodeMirror MIME（未命中则纯文本，不报错）
+function cmModeFor(path){
+  const ext=String(path||'').split('.').pop().toLowerCase();
+  const map={
+    js:'javascript',mjs:'javascript',cjs:'javascript',jsx:'javascript',ts:'javascript',tsx:'javascript',json:'application/json',
+    css:'text/css',scss:'text/x-scss',less:'text/x-less',
+    html:'text/html',htm:'text/html',xml:'application/xml',svg:'application/xml',vue:'text/html',
+    md:'text/x-markdown',markdown:'text/x-markdown',
+    py:'text/x-python',sh:'text/x-sh',bash:'text/x-sh',yml:'text/x-yaml',yaml:'text/x-yaml',
+    sql:'text/x-sql',c:'text/x-csrc',h:'text/x-csrc',cpp:'text/x-c++src',cc:'text/x-c++src',java:'text/x-java',
+    go:'text/x-go'
+  };
+  return map[ext]||null;
+}
+function openFileEditor(path, content){
+  fileEditPath=path;
+  const pt=$('#fileEditPath'); if(pt) pt.textContent=path;
+  const ta=$('#fileEditArea');
+  const dark=!!(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);
+  const mode=cmModeFor(path);
+  if(window.CodeMirror && ta){
+    if(!fileEditorCM){
+      fileEditorCM=window.CodeMirror.fromTextArea(ta,{
+        mode:mode||null, lineNumbers:true, lineWrapping:true, indentUnit:2, tabSize:2,
+        theme:dark?'material-darker':'default'
+      });
+    } else {
+      fileEditorCM.setOption('mode', mode||null);
+    }
+    fileEditorCM.setValue(content||'');
+    setTimeout(function(){ try{ fileEditorCM.refresh(); }catch(e){} },60);
+  } else if(ta){
+    ta.value=content||''; // 脚本未就绪时退化为纯文本，功能不受影响
+  }
+  $('#fileEditor').classList.remove('hidden');
+  setTimeout(function(){ try{ fileEditorCM&&fileEditorCM.refresh(); }catch(e){} },200);
+}
 async function saveFileEdit(){
-  const content=$('#fileEditArea').value;
+  const content = fileEditorCM ? fileEditorCM.getValue() : $('#fileEditArea').value;
   opBanner('正在保存文件…','busy');
   const r=await api(API_BASE+'/file',{method:'PUT',body:JSON.stringify({path:fileEditPath,content,branch:curBranch()})});
   if(r.status===401){ redirectLogin(); return; }
@@ -3132,7 +3230,6 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
 
   <!-- 管理文章（默认首页） -->
   <div id="page-manage" class="${pageCls("manage")}">
-    <div id="buildBanner" class="build-banner hidden" style="margin-bottom:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap"></div>
     <div class="wk-card">
       <div class="toolbar" style="justify-content:space-between;align-items:center">
         <h3 class="wk-title" style="margin:0;border:none;padding:0">已有文章</h3>
@@ -3244,7 +3341,6 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
 
   <!-- 部署记录 -->
   <div id="page-build" class="${pageCls("build")}">
-    <div id="buildBannerBuild" class="build-banner hidden" style="margin-bottom:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap"></div>
     <div class="wk-card">
       <div class="toolbar" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
         <h3 class="wk-title" style="margin:0;border:none;padding:0">工作流运行记录</h3>
@@ -3253,10 +3349,13 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
             <option value="">全部工作流</option>
           </select>
           <button class="wk-btn ghost sm" onclick="loadBuildHistory()">刷新</button>
-          <button class="wk-btn act sm" onclick="triggerBuild()">▶ 运行完整部署</button>
+          <select class="wk-input" id="buildRunWf" title="选择要运行的工作流" style="width:auto;min-width:150px;padding:4px 8px">
+            <option value="">选择要运行的工作流…</option>
+          </select>
+          <button class="wk-btn act sm" onclick="triggerSelectedWorkflow()">▶ 运行</button>
         </div>
       </div>
-      <p class="wk-label" style="margin-top:0">下拉可切换查看不同工作流（完整部署 / 更新 GitHub Pages / 克隆仓库 等）的运行记录；点「查看日志」经 Cloudflare 代理直接看日志，无需跳转 GitHub。</p>
+      <p class="wk-label" style="margin-top:0">左侧下拉切换查看不同工作流（完整部署 / 更新 GitHub Pages / 克隆仓库 等）的运行记录，右侧下拉选择要运行的工作流；点「查看日志」经 Cloudflare 代理直接看日志，无需跳转 GitHub。</p>
       <div class="table-scroll"><div id="buildHistory" class="empty">加载中...</div></div>
     </div>
   </div>
