@@ -362,6 +362,14 @@ app.get("/admin/api/build/history", async (c) => {
   return handleBuildHistory(c.env as Bindings);
 });
 
+// 部署工作流日志：/admin/api/build/log?id=<runId>
+// 由 Cloudflare 直接代理获取 GitHub Actions 运行日志（zip）并解压为文本，前端无需跳转 GitHub。
+// id 缺省时取最近一次 deploy.yml 运行。
+app.get("/admin/api/build/log", async (c) => {
+  if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
+  return handleBuildLog(c.env as Bindings, c.req.query("id") || "");
+});
+
 // ---------- 访问量（仅管理员可见）----------
 // 最近 N 天趋势：/admin/api/visit/daily?days=30
 app.get("/admin/api/visit/daily", async (c) => {
@@ -992,6 +1000,7 @@ const AI_TOOLS = [
   { type: "function", function: { name: "download_file", description: "从网络下载一个文件并保存到博客仓库（exe/图片/zip/压缩包等二进制均可）。url 也可传 GitHub 仓库的 owner/repo 或 https://github.com/owner/repo 链接，会自动下载该仓库源码 zip。path 为仓库内目标路径：以 / 结尾或省略表示目录（自动使用下载文件名），否则视为完整文件路径。上限约 45MB。", parameters: { type: "object", properties: { url: { type: "string", description: "http(s) 下载地址，或 GitHub 仓库 owner/repo" }, path: { type: "string", description: "仓库内目标路径或目录（目录以 / 结尾），可省略" }, name: { type: "string", description: "可选：保存的文件名" }, branch: { type: "string", description: "可选：分支，默认当前分支" } }, required: ["url"] } } },
   { type: "function", function: { name: "unzip_file", description: "解压仓库内已有的 zip 文件到它所在目录：小于 50MB 由 Cloudflare 即时解压；大于 50MB 自动触发 GitHub 工作流异步解压。", parameters: { type: "object", properties: { path: { type: "string", description: "zip 文件在仓库中的完整路径" }, branch: { type: "string", description: "可选：分支" } }, required: ["path"] } } },
   { type: "function", function: { name: "unzip_status", description: "查询大文件解压工作流（unzip.yml）的运行状态与最近结果。", parameters: { type: "object", properties: {} } } },
+  { type: "function", function: { name: "get_build_logs", description: "获取部署工作流（deploy.yml）的运行日志文本，用于排查构建失败原因。runId 可省略，默认取最近一次运行。", parameters: { type: "object", properties: { runId: { type: "string", description: "可选：工作流 run id，省略则为最近一次" } } } } },
 ];
 
 // set_setting 允许修改的设置项（站点功能走 wl_Settings，其余写入订阅/SMTP 配置）
@@ -1019,6 +1028,7 @@ async function aiToolsHint(db: D1Database): Promise<string> {
     "发邮件：用 send_email 发单封（to）或 broadcast=true 群发给已确认订阅者；需先在设置里配置 SMTP。发送前可先用 get_settings 确认 smtp.host 与 hasPass。",
     "联网：用 http_get 抓取网页或调用 GET 类接口，用 http_post 提交数据或调用写入类接口（需 http(s):// 开头，可自定义 headers/contentType）。响应体会自动截断，超长内容请分页或改用接口的查询参数。",
     "下载与解压：用 download_file 把网络上的文件（含 GitHub 仓库 owner/repo 源码 zip）保存进仓库；用 unzip_file 解压仓库里的 zip（<50MB 即时完成，>50MB 触发 GitHub 工作流异步解压，可用 unzip_status 查看进度）。",
+    "部署排错：用 build_status 查看部署状态；用 get_build_logs 拉取部署工作流日志文本（可传 runId，省略则取最近一次），用于分析构建失败原因。",
     names.length
       ? "当前可用的密钥占位符：" + names.map((n) => "{" + n + "}").join("、")
       : "当前没有配置任何密钥占位符（管理员可在「设置 → AI 密钥」中添加）。",
@@ -1085,6 +1095,13 @@ async function aiRunTool(env: Bindings, name: string, args: Record<string, unkno
       return jr(await handleListBranches(env));
     case "build_status":
       return jr(await handleBuildStatus(env));
+    case "get_build_logs": {
+      const r = await handleBuildLog(env, s("runId"));
+      const d = (await r.json().catch(() => ({}))) as { text?: unknown };
+      if (d && typeof d.text === "string" && d.text.length > 30000)
+        d.text = d.text.slice(-30000) + "\n...(为节省上下文，日志已截断)";
+      return JSON.stringify(d);
+    }
     case "write_file":
       return jr(await handleSaveFile(env, { path: s("path"), content: applySecrets(s("content"), secrets) }));
     case "delete_file":
@@ -2577,6 +2594,51 @@ async function handleBuildHistory(env: Bindings): Promise<Response> {
       html_url: r.html_url || "",
     }));
     return json({ ok: true, runs });
+  } catch (e) {
+    return json({ ok: false, error: String(e) }, 500);
+  }
+}
+
+// 部署工作流日志（Cloudflare 代理）：获取 GitHub Actions 运行日志 zip，解压为纯文本返回。
+// GitHub 的 /actions/runs/{id}/logs 会 302 到签名地址（zip），fetch 自动跟随；用 fflate 解压。
+async function handleBuildLog(env: Bindings, runId: string): Promise<Response> {
+  const { token, repo, headers } = ghConfig(env);
+  if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
+  try {
+    let id = String(runId || "").trim();
+    if (!id) {
+      const lr = await fetch(
+        `https://api.github.com/repos/${repo}/actions/workflows/deploy.yml/runs?per_page=1`,
+        { headers },
+      );
+      if (!lr.ok) return json({ ok: false, error: "github error " + lr.status }, 502);
+      const ld = (await lr.json()) as any;
+      id = String(ld.workflow_runs?.[0]?.id || "");
+      if (!id) return json({ ok: false, error: "没有可用的工作流运行记录" }, 404);
+    }
+    const res = await fetch(`https://api.github.com/repos/${repo}/actions/runs/${id}/logs`, { headers });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      return json({ ok: false, error: "获取日志失败 github error " + res.status, detail: detail.slice(0, 300) }, 502);
+    }
+    const buf = new Uint8Array(await res.arrayBuffer());
+    let text = "";
+    try {
+      const files = unzipSync(buf);
+      const names = Object.keys(files).sort();
+      const parts: string[] = [];
+      for (const name of names) {
+        parts.push("===== " + name + " =====\n" + new TextDecoder().decode(files[name]));
+      }
+      text = parts.join("\n\n");
+    } catch {
+      // 极少数情况下不是 zip，直接按文本解码
+      text = new TextDecoder().decode(buf);
+    }
+    const max = 200000;
+    const truncated = text.length > max;
+    if (truncated) text = "...(日志过长，已截断，仅保留末尾)\n" + text.slice(-max);
+    return json({ ok: true, id, truncated, text });
   } catch (e) {
     return json({ ok: false, error: String(e) }, 500);
   }

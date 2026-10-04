@@ -580,7 +580,6 @@ async function loadAiSettings(){
     if(r.ok && r.data){
       const d = r.data;
       const bu = $('#aiBaseUrl'); if(bu) bu.value = d.baseUrl || '';
-      const en = $('#aiEnabled'); if(en) en.checked = !!d.enabled;
       const cp = $('#aiClientProxy'); if(cp) cp.checked = !!d.clientProxy;
       const pm = $('#aiPermission'); if(pm) pm.value = d.permission || 'safe';
       aiPicked = Array.isArray(d.models) && d.models.length ? d.models.slice() : (d.model ? [String(d.model)] : []);
@@ -593,7 +592,6 @@ async function loadAiSettings(){
   }catch(e){}
 }
 async function saveAiSettings(){
-  const en = $('#aiEnabled');
   aiSyncModelsFromText(); // 以文本框为准（可能刚编辑过还没失焦）
   const picked = aiPicked.slice();
   // 没有独立的「默认模型」：以第一个已选模型作为助手默认，其余可在助手里切换
@@ -603,7 +601,6 @@ async function saveAiSettings(){
     model: picked[0] || '',
     models: picked,
     prompt: aiVal('aiPrompt'),
-    enabled: !!(en && en.checked),
     clientProxy: aiProxyOn(),
     permission: aiVal('aiPermission') || 'safe'
   };
@@ -2175,21 +2172,56 @@ let buildTimer=null;
 async function initBuildStatus(){
   const r=await api(API_BASE+'/build');
   const d=r.data||{};
-  if(r.ok&&d&&d.running){
+  if(!r.ok||!d||!d.ok) return;
+  if(d.running){
     showBuildBanner('部署工作流正在重建站点…');
     pollBuild();
+    return;
   }
+  // 非运行中：最近一次失败也保留横幅与「查看日志 / 发给 AI」入口，成功后自动清除
+  const latest=d.latest||{};
+  if(latest.conclusion && latest.conclusion!=='success') showBuildResult(latest.conclusion, latest.id);
+  else hideBuildBanner();
 }
+function buildBannerTargets(){ return [$('#globalBuildBanner'), $('#buildBanner'), $('#buildBannerBuild')]; }
 function showBuildBanner(msg, cls){
-  [$('#buildBanner'), $('#buildBannerBuild')].forEach((b)=>{
+  buildBannerTargets().forEach((b)=>{
     if(!b) return;
     b.className='build-banner '+(cls||'');
     b.textContent=msg;
     b.classList.remove('hidden');
   });
 }
+// 允许横幅里放按钮（如失败时的「查看日志 / 发给 AI」）
+function showBuildBannerHtml(html, cls){
+  buildBannerTargets().forEach((b)=>{
+    if(!b) return;
+    b.className='build-banner '+(cls||'');
+    b.innerHTML=html;
+    b.classList.remove('hidden');
+  });
+}
 function hideBuildBanner(){
-  [$('#buildBanner'), $('#buildBannerBuild')].forEach((b)=>{ if(b) b.classList.add('hidden'); });
+  buildBannerTargets().forEach((b)=>{ if(b) b.classList.add('hidden'); });
+}
+// 当前是否有可展示的构建结果 + AI 是否已配置（决定是否显示「发给 AI」）
+let aiConfigured=false;
+async function checkAiConfigured(){
+  try{
+    const r=await api(API_BASE+'/ai/settings');
+    const d=r.data||{};
+    aiConfigured = !!(d.baseUrl && d.hasKey && ((d.models&&d.models.length) || d.model));
+  }catch(e){ aiConfigured=false; }
+}
+// 部署结束（成功/失败）：失败时在横幅里给出「查看日志(CF代理)」与「发给 AI」入口
+function showBuildResult(conclusion, runId){
+  const ok = conclusion==='success' || conclusion==='completed';
+  if(ok){ showBuildBanner('站点已更新完成，可以刷新首页查看','ok'); return; }
+  const id = runId ? String(runId) : '';
+  let html = '<span>部署工作流失败（'+esc(conclusion||'未知')+'）</span>';
+  html += '<button class="wk-btn ghost sm" onclick="showBuildLog(\\''+esc(id)+'\\')">查看日志(CF代理)</button>';
+  if(aiConfigured) html += '<button class="wk-btn ghost sm" onclick="sendBuildLogsToAi(\\''+esc(id)+'\\')">发给 AI</button>';
+  showBuildBannerHtml(html,'err');
 }
 function pollBuild(){
   if(buildTimer) clearInterval(buildTimer);
@@ -2204,16 +2236,14 @@ function pollBuild(){
     }
     const runs=d.runs||[];
     if(d.running){
-      showBuildBanner('正在重建站点，已等待约 '+(tries*5)+' 秒…');
-      if(tries>=24){ clearInterval(buildTimer); buildTimer=null; showBuildBanner('重建仍在进行，稍后可刷新站点查看','err'); return; }
+      showBuildBanner('部署工作流正在运行中，已等待约 '+(tries*5)+' 秒…');
+      if(tries>=24){ clearInterval(buildTimer); buildTimer=null; showBuildBanner('部署工作流仍在运行中，可稍后刷新查看',''); return; }
       return;
     }
     clearInterval(buildTimer); buildTimer=null;
-    if(d.conclusion==='success'||d.conclusion==='completed'){
-      showBuildBanner('站点已更新完成，可以刷新首页查看','ok');
-    } else {
-      showBuildBanner('工作流结束（'+(d.conclusion||d.status||'未知')+'），可能未成功，请到 '+esc(d.html_url||'')+' 查看详情','err');
-    }
+    const runId=(d.latest&&d.latest.id)||(runs[0]&&runs[0].id)||'';
+    showBuildResult(d.conclusion||d.status, runId);
+    const box=$('#buildHistory'); if(box) loadBuildHistory();
   }, 5000);
 }
 
@@ -2255,16 +2285,58 @@ async function loadBuildHistory(){
   if(!r.ok){ box.innerHTML='<div class="empty">加载失败：'+(r.data&&r.data.error||r.status)+'</div>'; return; }
   const runs=r.data.runs||[];
   if(!runs.length){ box.innerHTML='<div class="empty">暂无部署记录</div>'; return; }
-  let html='<table class="wk-build-table"><thead><tr><th>#</th><th>时间</th><th>提交</th><th>状态</th><th>日志</th></tr></thead><tbody>';
+  let html='<table class="wk-build-table"><thead><tr><th>#</th><th>时间</th><th>提交</th><th>状态</th><th>操作</th></tr></thead><tbody>';
   runs.forEach(rn=>{
     const t=rn.created_at?new Date(rn.created_at).toLocaleString('zh-CN',{hour12:false}):'';
-    html+='<tr><td><a href="'+esc(rn.html_url)+'" target="_blank" rel="noopener">#'+esc(rn.id)+'</a></td>'+
+    const id=esc(rn.id);
+    html+='<tr><td><a href="'+esc(rn.html_url)+'" target="_blank" rel="noopener">#'+id+'</a></td>'+
       '<td>'+esc(t)+'</td><td><code>'+esc(rn.head_sha)+'</code></td>'+
       '<td>'+buildBadge(rn.status,rn.conclusion)+'</td>'+
-      '<td><a class="wk-btn ghost sm" href="'+esc(rn.html_url)+'" target="_blank" rel="noopener">查看日志 ↗</a></td></tr>';
+      '<td style="white-space:nowrap">'+
+        '<a class="wk-btn ghost sm" href="'+esc(rn.html_url)+'" target="_blank" rel="noopener" title="在 GitHub 打开">↗</a> '+
+        '<button class="wk-btn ghost sm" onclick="showBuildLog(\\''+id+'\\')">查看日志</button>'+
+        (aiConfigured?' <button class="wk-btn ghost sm" onclick="sendBuildLogsToAi(\\''+id+'\\')">发给 AI</button>':'')+
+      '</td></tr>';
   });
   html+='</tbody></table>';
   box.innerHTML=html;
+}
+
+// ---------- 工作流日志（Cloudflare 代理获取，不跳转 GitHub）----------
+let logModalRunId='';
+function closeLogModal(){ const m=$('#logModal'); if(m) m.classList.add('hidden'); }
+async function fetchBuildLog(runId){
+  const r=await api(API_BASE+'/build/log?id='+encodeURIComponent(runId||''));
+  if(r.status===401){ redirectLogin(); return null; }
+  if(!r.ok||!r.data||!r.data.ok) return null;
+  return r.data;
+}
+async function showBuildLog(runId){
+  const m=$('#logModal'), body=$('#logModalBody'); if(!m||!body) return;
+  logModalRunId=runId||'';
+  m.classList.remove('hidden');
+  const gh=$('#logModalGh');
+  if(gh) gh.href=logModalRunId?('https://github.com/__REPO__/actions/runs/'+logModalRunId):'https://github.com/__REPO__/actions';
+  const ttl=$('#logModalTitle'); if(ttl) ttl.textContent=logModalRunId?('#'+logModalRunId):'（最近一次）';
+  const ai=$('#logModalAi');
+  if(ai){ ai.classList.toggle('hidden', !aiConfigured); ai.onclick=()=>sendBuildLogsToAi(logModalRunId); }
+  body.textContent='正在从 GitHub 获取日志（经 Cloudflare 代理）…';
+  const d=await fetchBuildLog(logModalRunId);
+  if(!d){ body.textContent='获取日志失败，请稍后重试，或点右上角「在 GitHub 打开」查看。'; return; }
+  body.textContent=d.text||'（日志为空）';
+}
+// 把失败日志发给 AI 助手分析：切到 AI 页，填入日志并自动发送
+async function sendBuildLogsToAi(runId){
+  closeLogModal();
+  go('ai');
+  const input=$('#aiInput');
+  const head='部署工作流'+(runId?(' #'+runId):'（最近一次）')+'失败了，请分析下面的构建日志，指出失败原因并给出修复建议：\\n\\n';
+  if(input){ input.value=head+'（正在获取日志…）'; aiAutoGrow(); }
+  const d=await fetchBuildLog(runId);
+  let log=(d&&d.text)||'（未能获取到日志）';
+  if(log.length>12000) log='...(日志已截断)\\n'+log.slice(-12000);
+  if(input){ input.value=head+log; aiAutoGrow(); input.focus(); }
+  setTimeout(()=>{ aiSend(); }, 80);
 }
 
 // ---------- 文件管理 ----------
@@ -2623,6 +2695,9 @@ document.addEventListener('DOMContentLoaded', ()=>{
       } else {
         switchTab(window.__INITIAL__||'manage');
       }
+      // 全局：任意标签页都能看到「正在运行的部署工作流」与失败入口
+      // 先确认 AI 是否已配置，再渲染横幅（决定失败横幅里是否给「发给 AI」按钮）
+      checkAiConfigured().finally(()=>initBuildStatus());
     }).catch(()=>redirectLogin());
 
   $('#logoutBtn').onclick=()=>{
@@ -2695,6 +2770,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   $('#upInput').onchange=e=>{ doUpload(Array.from(e.target.files||[])); e.target.value=''; };
   $('#upDirBtn').onclick=upLevel;
   $('#dlUrlBtn').onclick=downloadFromUrl;
+  const lm=$('#logModal'); if(lm) lm.addEventListener('click',e=>{ if(e.target===lm) closeLogModal(); });
   $('#branchSel').onchange=e=>{ fileBranch=e.target.value||'main'; filePath=''; loadFiles(); };
   $('#newFolderBtn').onclick=newFolder;
   // 文件管理：多选 / 回收站
@@ -2765,9 +2841,12 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
 
 <div class="wk-wrap">
 
+  <!-- 全局工作流横幅：任意标签页都能看到「正在运行 / 失败」 -->
+  <div id="globalBuildBanner" class="build-banner hidden" style="margin:0 0 12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap"></div>
+
   <!-- 管理文章（默认首页） -->
   <div id="page-manage" class="${pageCls("manage")}">
-    <div id="buildBanner" class="build-banner hidden" style="margin-bottom:0"></div>
+    <div id="buildBanner" class="build-banner hidden" style="margin-bottom:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap"></div>
     <div class="wk-card">
       <div class="toolbar" style="justify-content:space-between;align-items:center">
         <h3 class="wk-title" style="margin:0;border:none;padding:0">已有文章</h3>
@@ -2877,7 +2956,7 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
 
   <!-- 部署记录 -->
   <div id="page-build" class="${pageCls("build")}">
-    <div id="buildBannerBuild" class="build-banner hidden" style="margin-bottom:10px"></div>
+    <div id="buildBannerBuild" class="build-banner hidden" style="margin-bottom:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap"></div>
     <div class="wk-card">
       <div class="toolbar" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
         <h3 class="wk-title" style="margin:0;border:none;padding:0">部署记录</h3>
@@ -2990,11 +3069,11 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
           <span class="wk-label" style="margin:0">模型</span>
           <select class="wk-input" id="aiChatModel" onchange="aiSetChatModel(this.value)" style="width:auto;flex:1 1 140px;min-width:80px;max-width:320px;padding:4px 8px"></select>
           <span class="wk-label" style="margin:0">权限</span>
-          <select class="wk-input" id="aiChatPermission" onchange="aiSetPermission(this.value)" title="权限：安全=仅对话；重要=危险操作确认；全部=每步确认；完全=无需确认" style="width:auto;flex:0 0 auto;min-width:0;padding:4px 8px">
-            <option value="safe" title="安全访问 · 仅对话">安全</option>
-            <option value="important" title="重要确认 · 危险操作确认">重要</option>
-            <option value="all" title="全部确认 · 每步都确认">全部</option>
-            <option value="full" title="完全访问 · 无需确认">完全</option>
+          <select class="wk-input" id="aiChatPermission" onchange="aiSetPermission(this.value)" title="权限：安全模式=仅对话；重要确认=危险操作确认；全部确认=每步确认；完全允许=无需确认" style="width:auto;flex:0 0 auto;min-width:0;padding:4px 8px">
+            <option value="safe" title="安全模式 · 仅对话，不执行任何操作">安全模式</option>
+            <option value="important" title="重要确认 · 危险操作需确认">重要确认</option>
+            <option value="all" title="全部确认 · 每次工具调用都需确认">全部确认</option>
+            <option value="full" title="完全允许 · 无需确认，直接执行">完全允许</option>
           </select>
           <span class="wk-label" style="margin:0">思考强度</span>
           <select class="wk-input" id="aiChatThink" onchange="aiSetThink(this.value)" title="思考强度会作为 reasoning_effort 发给服务商；需所选模型支持推理（如 deepseek-reasoner），不支持时会报错" style="width:auto;flex:0 0 auto;min-width:0;padding:4px 8px">
@@ -3130,17 +3209,14 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
         <label class="wk-label" style="margin-top:12px">已选的模型（多个用英文逗号分隔，可直接编辑，与下方「可选模型」联动）</label>
         <input class="wk-input" id="aiModelsText" placeholder="如：gpt-4o-mini, deepseek-chat" oninput="aiSyncModelsFromText()">
         <label class="wk-label" style="display:flex;align-items:center;gap:6px;margin-top:10px;cursor:pointer">
-          <input type="checkbox" id="aiEnabled" style="width:auto"> 启用 AI 设置
-        </label>
-        <label class="wk-label" style="display:flex;align-items:center;gap:6px;margin-top:6px;cursor:pointer">
           <input type="checkbox" id="aiClientProxy" style="width:auto"> 前端代理：由浏览器直连服务商
         </label>
         <label class="wk-label" style="margin-top:14px">权限级别（AI 可执行的操作范围）</label>
         <select class="wk-input" id="aiPermission">
-          <option value="safe">安全访问 · 仅对话，不执行任何操作</option>
+          <option value="safe">安全模式 · 仅对话，不执行任何操作</option>
           <option value="important">重要确认 · 危险操作需确认（写文件 / 删除 / 部署 / 改设置）</option>
           <option value="all">全部确认 · 每次工具调用都需确认</option>
-          <option value="full">完全访问 · 无需确认，直接执行</option>
+          <option value="full">完全允许 · 无需确认，直接执行</option>
         </select>
         <div class="filters" style="margin:14px 0 0">
           <button class="wk-btn sm" onclick="saveAiSettings()">保存配置</button>
@@ -3366,6 +3442,21 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
     </details>
   </div>
 
+</div>
+
+<!-- 工作流日志弹窗（CF 代理获取，不跳转 GitHub） -->
+<div id="logModal" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:200;display:flex;align-items:center;justify-content:center;padding:16px">
+  <div class="wk-card" style="max-width:900px;width:100%;max-height:86vh;display:flex;flex-direction:column;margin:0">
+    <div class="toolbar" style="justify-content:space-between;align-items:center;gap:6px;flex-wrap:wrap">
+      <h3 class="wk-title" style="margin:0;border:none;padding:0">工作流日志<span id="logModalTitle" class="wk-label" style="margin-left:8px"></span></h3>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <a class="wk-btn ghost sm" id="logModalGh" target="_blank" rel="noopener">在 GitHub 打开 ↗</a>
+        <button class="wk-btn ghost sm hidden" id="logModalAi">发给 AI</button>
+        <button class="wk-btn ghost sm" onclick="closeLogModal()">关闭</button>
+      </div>
+    </div>
+    <div id="logModalBody" style="flex:1;overflow:auto;white-space:pre-wrap;word-break:break-all;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--input-bg);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:10px;margin-top:10px">加载中...</div>
+  </div>
 </div>
 
 <script src="${VDIRTOR_JS}"></script>
