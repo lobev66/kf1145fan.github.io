@@ -401,8 +401,11 @@ function go(name){
     if(name==='settings'){ loadSubscribeSettings(); loadSiteSettings(); loadAiSettings(); loadSecrets(); }
     window.scrollTo(0,0);
   }
-  // AI 页保留会话 id（/admin/ai/<id>），其余标签页用 /admin/<name>
-  const url = (name === 'ai' && aiConvId) ? ('/admin/ai/' + aiConvId) : ('/admin/' + name);
+  // AI 页保留会话 id（/admin/ai/<id>）；文件管理页带上当前目录（?pwd=分支/路径），刷新回到原位置；其余用 /admin/<name>
+  let url;
+  if(name === 'ai' && aiConvId) url = '/admin/ai/' + aiConvId;
+  else if(name === 'files') url = '/admin/files?pwd=' + encodeURIComponent(curBranch() + (filePath ? '/' + filePath : ''));
+  else url = '/admin/' + name;
   try{ history.replaceState(null,'',url); }catch(e){}
 }
 function switchTab(name){ go(name); }
@@ -2498,6 +2501,24 @@ function fileApi(url){
   const sep=url.indexOf('?')>=0?'&':'?';
   return url+sep+'branch='+encodeURIComponent(curBranch());
 }
+// 从 URL 的 ?pwd=<分支>/<路径> 恢复浏览位置（刷新后仍停留在原目录）
+function fileParseUrl(){
+  try{
+    const pwd=new URLSearchParams(location.search).get('pwd')||'';
+    if(!pwd) return;
+    const i=pwd.indexOf('/');
+    if(i<0){ fileBranch=pwd; filePath=''; }
+    else { fileBranch=pwd.slice(0,i); filePath=pwd.slice(i+1); }
+  }catch(e){}
+}
+// 把当前「分支/目录」写回地址栏（仅文件管理页），刷新后回到原位置
+function fileSyncUrl(){
+  if(activePage!=='files') return;
+  try{
+    const pwd=curBranch()+(filePath?('/'+filePath):'');
+    history.replaceState(null,'','/admin/files?pwd='+encodeURIComponent(pwd));
+  }catch(e){}
+}
 function fmtSize(n){
   n=n||0;
   if(n<1024) return n+' B';
@@ -2527,14 +2548,20 @@ async function loadBranches(selectCur){
   const r=await api(API_BASE+'/branches');
   if(!r.ok||!r.data){ return; }
   const branches=r.data.branches||[];
-  if(selectCur) fileBranch=r.data.current||'main';
+  // URL 里 ?pwd= 指定的分支优先保留；否则用仓库当前分支
+  const wanted=fileBranch;
+  const before=wanted||'main';
+  if(selectCur && !wanted) fileBranch=r.data.current||'main';
   sel.innerHTML='';
   branches.forEach(b=>{
     const o=document.createElement('option'); o.value=b; o.textContent=b; sel.appendChild(o);
   });
-  sel.value=fileBranch||(r.data.current||'main');
-  if(!fileBranch||!sel.value) fileBranch=sel.value||'main';
+  if(fileBranch && branches.indexOf(fileBranch)<0) fileBranch='';
+  if(!fileBranch) fileBranch=(r.data.current&&branches.indexOf(r.data.current)>=0)?r.data.current:(branches[0]||r.data.current||'main');
+  sel.value=fileBranch;
   branchesLoaded=true;
+  // 分支实际值与此前加载文件时用的不同（如 URL 分支失效或首次判定当前分支）：重载当前目录
+  if(activePage==='files' && fileBranch!==before) loadFiles();
 }
 async function loadFiles(){
   const list=$('#fileList'); if(!list) return;
@@ -2543,6 +2570,7 @@ async function loadFiles(){
   if(r.status===401){ redirectLogin(); return; }
   selectedFiles.clear();
   renderCrumb();
+  fileSyncUrl(); // 目录/分支变化后同步到地址栏 ?pwd=，刷新回到原位置
   updateFileToolbar();
   if(!r.ok){
     if(isRecycleView()){ list.innerHTML='<li class="empty">回收站是空的</li>'; hideFileBatchBar(); return; }
@@ -2967,6 +2995,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   const lm=$('#logModal'); if(lm) lm.addEventListener('click',e=>{ if(e.target===lm) closeLogModal(); });
   $('#branchSel').onchange=e=>{ fileBranch=e.target.value||'main'; filePath=''; loadFiles(); };
   $('#newFolderBtn').onclick=newFolder;
+  $('#fileRefreshBtn').onclick=()=>{ loadBranches(); loadFiles(); resumeUnzipStatus(); };
   // 文件管理：多选 / 回收站
   $('#recycleBtn').onclick=()=>{ filePath=isRecycleView()?'':RECYCLE_DIR; loadFiles(); };
   $('#fileList').addEventListener('change',e=>{
@@ -2988,6 +3017,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   $('#fileBatchRecycle').onclick=()=>fileBatchOp('recycle');
   $('#fileBatchRestore').onclick=()=>fileBatchOp('restore');
   $('#fileBatchPurge').onclick=()=>fileBatchOp('purge');
+  fileParseUrl(); // 先按 URL 的 ?pwd= 恢复分支与目录，再加载分支
   loadBranches(true);
   $$('.wk-tab').forEach(t=>t.onclick=()=>switchTab(t.dataset.tab));
 });
@@ -3118,6 +3148,7 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
           <button class="wk-btn ghost sm" id="dlUrlBtn" title="从网络下载文件保存到当前目录">从网络下载</button>
           <button class="wk-btn ghost sm" id="cloneRepoBtn" title="把外部 Git 仓库克隆到当前目录（如克隆一个 Hexo 主题）">克隆仓库</button>
           <button class="wk-btn ghost sm" id="newFolderBtn">新建文件夹</button>
+          <button class="wk-btn ghost sm" id="fileRefreshBtn" title="刷新当前目录">刷新</button>
           <button class="wk-btn ghost sm" id="recycleBtn">回收站</button>
         </div>
         <input type="file" id="upInput" multiple style="display:none">

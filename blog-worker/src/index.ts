@@ -2272,6 +2272,133 @@ const RECYCLE_DIR = "_recycle";
 
 type OpResult = { path: string; ok: boolean; moved?: string; error?: string };
 
+// 分支名可能含 /，按段编码保留斜杠（Git 引用路径）
+function ghRefPath(branch: string): string {
+  return String(branch || "").split("/").map(encodeURIComponent).join("/");
+}
+
+// 读取分支的「最新提交 sha + 根树 sha + 递归文件清单」（Git 数据 API）
+// 用途：一次性批量移动/删除整个目录，避免逐文件请求触发 Worker 子请求上限
+async function ghTreeInfo(
+  env: Bindings,
+  branch: string,
+): Promise<{ ok: boolean; commitSha?: string; treeSha?: string; tree?: any[]; error?: string }> {
+  const { token, repo, headers } = ghConfig(env);
+  if (!token) return { ok: false, error: "GH_TOKEN not configured" };
+  try {
+    const refRes = await fetch(`https://api.github.com/repos/${repo}/git/ref/heads/${ghRefPath(branch)}`, { headers });
+    if (!refRes.ok) return { ok: false, error: "读取分支失败 " + refRes.status };
+    const ref = (await refRes.json()) as any;
+    const commitSha = ref?.object?.sha;
+    if (!commitSha) return { ok: false, error: "读取分支失败" };
+    const cRes = await fetch(`https://api.github.com/repos/${repo}/git/commits/${commitSha}`, { headers });
+    if (!cRes.ok) return { ok: false, error: "读取提交失败 " + cRes.status };
+    const commit = (await cRes.json()) as any;
+    const treeSha = commit?.tree?.sha;
+    if (!treeSha) return { ok: false, error: "读取树失败" };
+    const tRes = await fetch(`https://api.github.com/repos/${repo}/git/trees/${treeSha}?recursive=1`, { headers });
+    if (!tRes.ok) return { ok: false, error: "读取树失败 " + tRes.status };
+    const t = (await tRes.json()) as any;
+    return { ok: true, commitSha, treeSha, tree: Array.isArray(t?.tree) ? t.tree : [] };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+// 一次提交应用一批树变更（sha 为 null 表示删除该路径），共 3 个子请求
+async function ghCommitTree(
+  env: Bindings,
+  branch: string,
+  parentSha: string,
+  baseTreeSha: string,
+  entries: any[],
+  message: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const { token, repo, headers } = ghConfig(env);
+  if (!token) return { ok: false, error: "GH_TOKEN not configured" };
+  try {
+    const tRes = await fetch(`https://api.github.com/repos/${repo}/git/trees`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ base_tree: baseTreeSha, tree: entries }),
+    });
+    if (!tRes.ok) return { ok: false, error: "创建树失败 " + tRes.status };
+    const tree = (await tRes.json()) as any;
+    const cRes = await fetch(`https://api.github.com/repos/${repo}/git/commits`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ message, tree: tree.sha, parents: [parentSha] }),
+    });
+    if (!cRes.ok) return { ok: false, error: "创建提交失败 " + cRes.status };
+    const commit = (await cRes.json()) as any;
+    const rRes = await fetch(`https://api.github.com/repos/${repo}/git/refs/heads/${ghRefPath(branch)}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ sha: commit.sha, force: false }),
+    });
+    if (!rRes.ok) return { ok: false, error: "更新分支失败 " + rRes.status };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+// 取出目录下所有文件（含子目录；跳过子模块/树节点），返回递归清单中的 blob 条目
+function treeFilesUnder(tree: any[], dir: string): any[] {
+  const norm = String(dir).replace(/^\/+|\/+$/g, "");
+  return (tree || []).filter(
+    (e: any) => e && e.type === "blob" && (e.path === norm || String(e.path).startsWith(norm + "/")),
+  );
+}
+
+// 用一次提交把整个目录移到新位置（同一提交里：新路径引用原 blob，原路径置空删除）
+async function moveDirByTree(
+  env: Bindings,
+  from: string,
+  to: string,
+  branch: string,
+): Promise<{ ok: boolean; moved?: string; error?: string }> {
+  const info = await ghTreeInfo(env, branch);
+  if (!info.ok) return { ok: false, error: info.error };
+  const all = info.tree || [];
+  const normFrom = String(from).replace(/^\/+|\/+$/g, "");
+  const normTo = String(to).replace(/^\/+|\/+$/g, "");
+  const under = treeFilesUnder(all, normFrom);
+  if (!under.length) return { ok: false, error: "目录为空或不存在" };
+  // 目标已存在时自动加序号，避免覆盖
+  const paths = new Set(all.map((e: any) => e.path));
+  const taken = (p: string) => paths.has(p) || all.some((e: any) => String(e.path).startsWith(p + "/"));
+  let target = normTo;
+  if (taken(target)) {
+    for (let i = 1; i <= 100; i++) {
+      const cand = normTo + "-" + i;
+      if (!taken(cand)) { target = cand; break; }
+    }
+  }
+  const entries: any[] = [];
+  for (const e of under) {
+    const rel = String(e.path).slice(normFrom.length).replace(/^\/+/, "");
+    entries.push({ path: target + "/" + rel, mode: e.mode || "100644", type: "blob", sha: e.sha });
+    entries.push({ path: e.path, mode: e.mode || "100644", type: "blob", sha: null });
+  }
+  const r = await ghCommitTree(env, branch, info.commitSha as string, info.treeSha as string, entries, `docs: move ${normFrom} -> ${target}`);
+  if (!r.ok) return { ok: false, error: r.error };
+  return { ok: true, moved: target };
+}
+
+// 用一次提交彻底删除整个目录
+async function deleteDirByTree(env: Bindings, path: string, branch: string): Promise<Response> {
+  const info = await ghTreeInfo(env, branch);
+  if (!info.ok) return json({ ok: false, error: info.error }, 500);
+  const norm = String(path).replace(/^\/+|\/+$/g, "");
+  const under = treeFilesUnder(info.tree || [], norm);
+  if (!under.length) return json({ ok: false, error: "目录为空或不存在" }, 404);
+  const entries = under.map((e: any) => ({ path: e.path, mode: e.mode || "100644", type: "blob", sha: null }));
+  const r = await ghCommitTree(env, branch, info.commitSha as string, info.treeSha as string, entries, `docs: delete ${norm}`);
+  if (!r.ok) return json({ ok: false, error: r.error }, 502);
+  return json({ ok: true, message: "已删除目录 " + norm });
+}
+
 // 读取仓库节点（文件或目录）；不存在返回 null
 async function ghGetNode(env: Bindings, path: string, branch: string): Promise<any | null> {
   const { repo, headers } = ghConfig(env);
@@ -2316,13 +2443,8 @@ async function movePath(
   if (!node) return { ok: false, error: "未找到 " + from };
 
   if (Array.isArray(node)) {
-    const target = await freePath(env, to, branch);
-    for (const f of node as any[]) {
-      const rel = String(f.path).slice(String(from).length).replace(/^\/+/, "");
-      const r = await movePath(env, f.path, `${target}/${rel}`, branch);
-      if (!r.ok) return r;
-    }
-    return { ok: true, moved: target };
+    // 目录：用 Git 数据 API 一次提交整体移动，避免大目录逐文件请求触顶
+    return moveDirByTree(env, from, to, branch);
   }
 
   const target = await freePath(env, to, branch);
@@ -2923,12 +3045,8 @@ async function deletePath(env: Bindings, path: string, branch?: string): Promise
     if (!exist.ok) return json({ ok: false, error: "未找到 " + path }, 404);
     const data = (await exist.json()) as any;
     if (Array.isArray(data)) {
-      for (const f of data as any[]) {
-        const r = await deletePath(env, f.path, useBranch);
-        const rr = (await r.json()) as { ok?: boolean };
-        if (!rr.ok) return r;
-      }
-      return json({ ok: true, message: "已删除目录 " + path });
+      // 目录：用 Git 数据 API 一次提交整体删除，避免大目录逐文件请求触顶
+      return deleteDirByTree(env, path, useBranch);
     }
     const res = await fetch(rawApi, {
       method: "DELETE",
