@@ -173,8 +173,8 @@ a{color:var(--accent);text-decoration:none}
 .ai-conv-t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ai-main{flex:1;display:flex;flex-direction:column;min-width:0}
 .ai-bar{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;padding:10px 14px;border-bottom:1px solid var(--border);flex-shrink:0;min-width:0}
-.ai-scroll{flex:1;overflow:auto;min-height:0;display:flex;justify-content:center}
-.ai-col{max-width:748px;width:100%;padding:18px 16px;display:flex;flex-direction:column;gap:16px}
+.ai-scroll{flex:1;overflow:auto;min-height:0;overflow-anchor:none}
+.ai-col{max-width:748px;width:100%;margin:0 auto;padding:18px 16px;display:flex;flex-direction:column;gap:16px}
 .ai-msg{display:flex;flex-direction:column;gap:4px;min-width:0}
 .ai-msg.user{align-items:flex-end}
 .ai-msg.assistant{align-items:stretch}
@@ -1394,18 +1394,19 @@ function scrollAiBottom(){
   const pin = function(){ try{ box.scrollTop = box.scrollHeight; }catch(e){} };
   pin();
   requestAnimationFrame(function(){ pin(); requestAnimationFrame(pin); });
-  clearTimeout(scrollAiBottom._t1); clearTimeout(scrollAiBottom._t2);
+  clearTimeout(scrollAiBottom._t1); clearTimeout(scrollAiBottom._t2); clearTimeout(scrollAiBottom._t3);
   scrollAiBottom._t1 = setTimeout(pin, 80);
   scrollAiBottom._t2 = setTimeout(pin, 260);
+  scrollAiBottom._t3 = setTimeout(pin, 600);
 }
-// 监听聊天内容高度变化：生成过程中（或用户已在底部附近）内容变高时保持贴底
+// 监听聊天内容高度变化：内容变高/变矮时贴底（生成中无条件贴底，生成后仅在用户已在底部附近时贴底）
 let aiColObserver = null;
 function aiEnsureColObserver(){
   const col = $('#aiCol'), box = $('#aiMessages');
   if(!col || !box || aiColObserver) return;
   try{
     aiColObserver = new ResizeObserver(function(){
-      const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 120;
+      const nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 160;
       if(aiStreaming || nearBottom) box.scrollTop = box.scrollHeight;
     });
     aiColObserver.observe(col);
@@ -2657,14 +2658,18 @@ async function clonePollTick(target){
   if(latest.conclusion==='success') loadFiles();
 }
 async function cloneRepoFromUrl(){
-  if(!confirm('克隆一个外部仓库到当前目录？\\n将自动触发 GitHub 工作流完成（约 10 秒），目标文件夹已存在且非空时会中止。')) return;
+  if(!confirm('克隆一个外部仓库？\\n将自动触发 GitHub 工作流完成（约 10 秒），目标目录已存在且非空时会中止。')) return;
   const repo=prompt('输入要克隆的仓库（owner/repo 或完整 URL），例如 Hexo 主题：');
   if(!repo||!repo.trim()) return;
   const slug=(repo.trim().split('/').filter(Boolean).pop()||'repo').replace(/\.git$/,'');
-  const sub=prompt('克隆到当前目录下的文件夹名：', slug);
+  const sub=prompt('克隆到哪个目录？\\n可填相对当前目录的路径（如 themes/next）；以 / 开头表示从仓库根目录算起。', slug);
   if(sub===null) return;
-  const name=(sub.trim()||slug);
-  const target=(filePath?filePath+'/':'')+name;
+  let name=(sub.trim()||slug);
+  const fromRoot=name.charAt(0)==='/';
+  while(name.charAt(0)==='/') name=name.slice(1);
+  while(name && name.charAt(name.length-1)==='/') name=name.slice(0,-1);
+  if(!name) name=slug;
+  const target=fromRoot?name:((filePath?filePath+'/':'')+name);
   toast('正在触发克隆工作流…');
   const r=await api(API_BASE+'/clone-repo',{method:'POST',body:JSON.stringify({repo_url:repo.trim(),target_dir:target,branch:curBranch()})});
   if(r.status===401){ redirectLogin(); return; }
