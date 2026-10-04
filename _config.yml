@@ -58,7 +58,7 @@ pagination_dir: page
 include: null
 exclude: null
 ignore: null
-theme: indigo
+theme: Wikitten
 deploy:
   type: git
   repo: https://github.com/kf1145fan/kf1145fan.github.io.git
