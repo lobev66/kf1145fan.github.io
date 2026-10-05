@@ -323,6 +323,9 @@ a{color:var(--accent);text-decoration:none}
 /* 文件编辑器：CodeMirror 填满剩余高度，跟随主题 */
 #fileEditor .CodeMirror{flex:1;height:auto;min-height:0;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 #fileEditor .CodeMirror-scroll{padding:6px 0}
+/* 按钮加载中的小转圈 */
+.wk-spin{display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:wk-spin .7s linear infinite;vertical-align:-1px;margin-right:4px}
+@keyframes wk-spin{to{transform:rotate(360deg)}}
 `;
 
 const SCRIPT = `
@@ -2320,12 +2323,20 @@ async function initBuildStatus(){
   const r=await api(API_BASE+'/workflows/runs?limit=30');
   const d=r.data||{};
   if(!r.ok||!d||!d.ok) return;
-  const runs=d.runs||[];
+  const runs=recentRuns(d.runs||[]);
   if(activeRuns(runs).length){ showRunningBanner(runs); startBuildPoll(); return; }
   stopBuildPoll();
-  const latest=d.latest||null;
+  const latest=runs[0]||null;
   if(!latest){ hideBuildBanner(); return; }
   showBuildResult(latest.conclusion, latest.id, wfLabel(latest));
+}
+// 只显示最近一小时内的运行：更早的成功/失败结果不再常驻顶部；叉掉后需有新运行才会再出现
+function recentRuns(runs){
+  const cut=Date.now()-3600*1000;
+  return (runs||[]).filter(function(r){
+    const t=Date.parse((r&&r.created_at)||'');
+    return isNaN(t)?true:t>=cut;
+  });
 }
 // 当前所有处于运行/排队状态的工作流（可能同时跑多个，如克隆 + 更新 GitHub）
 function activeRuns(runs){
@@ -2423,10 +2434,10 @@ function startBuildPoll(){
     const r=await api(API_BASE+'/workflows/runs?limit=30');
     const d=r.data||{};
     if(!r.ok||!d.ok){ if(tries>=12) stopBuildPoll(); return; }
-    const runs=d.runs||[];
+    const runs=recentRuns(d.runs||[]);
     if(activeRuns(runs).length){ showRunningBanner(runs, '（已等待约 '+(tries*5)+' 秒）'); return; }
     stopBuildPoll();
-    const latest=d.latest||null;
+    const latest=runs[0]||null;
     if(!latest){ hideBuildBanner(); return; }
     showBuildResult(latest.conclusion, latest.id, wfLabel(latest));
     const box=$('#buildHistory'); if(box) loadBuildHistory();
@@ -2785,12 +2796,16 @@ async function onFileClick(e){
     return;
   }
   if(a==='edit'){
+    // 读取文件要走 GitHub，约 1 秒：按钮先转圈，避免以为没反应
+    const old=btn.innerHTML;
+    btn.disabled=true; btn.innerHTML='<span class="wk-spin"></span>打开中';
     const r=await api(fileApi(API_BASE+'/file?path='+encodeURIComponent(path)));
+    btn.disabled=false; btn.innerHTML=old;
     if(r.status===401){ redirectLogin(); return; }
     if(!r.ok){ toast('读取失败：'+(r.data&&r.data.error||r.status),true); return; }
     const d=r.data||{};
     if(d.binary){ toast('二进制文件暂不支持在线编辑，请下载后修改再上传',true); return; }
-    cmEnsure(function(){ openFileEditor(path, d.content||''); });
+    openFileEditor(path, d.content||'');
     return;
   }
   if(a==='rename'){
@@ -2857,24 +2872,29 @@ function openFileEditor(path, content){
   fileEditPath=path;
   const pt=$('#fileEditPath'); if(pt) pt.textContent=path;
   const ta=$('#fileEditArea');
-  const dark=!!(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);
-  const mode=cmModeFor(path);
-  if(window.CodeMirror && ta){
-    if(!fileEditorCM){
-      fileEditorCM=window.CodeMirror.fromTextArea(ta,{
-        mode:mode||null, lineNumbers:true, lineWrapping:true, indentUnit:2, tabSize:2,
-        theme:dark?'material-darker':'default'
-      });
-    } else {
-      fileEditorCM.setOption('mode', mode||null);
-    }
-    fileEditorCM.setValue(content||'');
-    setTimeout(function(){ try{ fileEditorCM.refresh(); }catch(e){} },60);
-  } else if(ta){
-    ta.value=content||''; // 脚本未就绪时退化为纯文本，功能不受影响
-  }
+  // 先用纯文本立即打开，不等待 CDN：避免「打不开」或长时间白屏
+  if(fileEditorCM) fileEditorCM.setValue(content||'');
+  else if(ta) ta.value=content||'';
   $('#fileEditor').classList.remove('hidden');
-  setTimeout(function(){ try{ fileEditorCM&&fileEditorCM.refresh(); }catch(e){} },200);
+  applyCodeMirror();
+  // 高亮在后台按需加载，加载完成后自动把已打开的编辑器升级为高亮编辑器
+  cmEnsure(function(){ applyCodeMirror(); });
+}
+// CodeMirror 已就绪时：把当前编辑器切换为该文件类型的高亮模式（未就绪则保持纯文本）
+function applyCodeMirror(){
+  const ta=$('#fileEditArea');
+  if(!window.CodeMirror || !ta) return;
+  const dark=!!(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);
+  const mode=cmModeFor(fileEditPath);
+  if(!fileEditorCM){
+    fileEditorCM=window.CodeMirror.fromTextArea(ta,{
+      mode:mode||null, lineNumbers:true, lineWrapping:true, indentUnit:2, tabSize:2,
+      theme:dark?'material-darker':'default'
+    });
+  } else {
+    fileEditorCM.setOption('mode', mode||null);
+  }
+  setTimeout(function(){ try{ fileEditorCM.refresh(); }catch(e){} },60);
 }
 async function saveFileEdit(){
   const content = fileEditorCM ? fileEditorCM.getValue() : $('#fileEditArea').value;
