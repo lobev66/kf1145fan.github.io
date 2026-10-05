@@ -367,7 +367,7 @@ app.get("/admin/api/build/history", async (c) => {
 // id 缺省时取最近一次 deploy.yml 运行。
 app.get("/admin/api/build/log", async (c) => {
   if (!isAdmin(c.get("userInfo"))) return json({ error: "unauthorized" }, 401);
-  return handleBuildLog(c.env as Bindings, c.req.query("id") || "");
+  return handleBuildLog(c.env as Bindings, c.req.query("id") || "", c.req.query("workflow") || "");
 });
 
 // ---------- 通用工作流管理（列出 / 运行记录 / 运行 / 取消 / 克隆仓库）----------
@@ -1026,7 +1026,8 @@ const AI_TOOLS = [
   { type: "function", function: { name: "download_file", description: "从网络下载一个文件并保存到博客仓库（exe/图片/zip/压缩包等二进制均可）。url 也可传 GitHub 仓库的 owner/repo 或 https://github.com/owner/repo 链接，会自动下载该仓库源码 zip。path 为仓库内目标路径：以 / 结尾或省略表示目录（自动使用下载文件名），否则视为完整文件路径。上限约 45MB。", parameters: { type: "object", properties: { url: { type: "string", description: "http(s) 下载地址，或 GitHub 仓库 owner/repo" }, path: { type: "string", description: "仓库内目标路径或目录（目录以 / 结尾），可省略" }, name: { type: "string", description: "可选：保存的文件名" }, branch: { type: "string", description: "可选：分支，默认当前分支" } }, required: ["url"] } } },
   { type: "function", function: { name: "unzip_file", description: "解压仓库内已有的 zip 文件到它所在目录：小于 50MB 由 Cloudflare 即时解压；大于 50MB 自动触发 GitHub 工作流异步解压。", parameters: { type: "object", properties: { path: { type: "string", description: "zip 文件在仓库中的完整路径" }, branch: { type: "string", description: "可选：分支" } }, required: ["path"] } } },
   { type: "function", function: { name: "unzip_status", description: "查询大文件解压工作流（unzip.yml）的运行状态与最近结果。", parameters: { type: "object", properties: {} } } },
-  { type: "function", function: { name: "get_build_logs", description: "获取部署工作流（deploy.yml）的运行日志文本，用于排查构建失败原因。runId 可省略，默认取最近一次运行。", parameters: { type: "object", properties: { runId: { type: "string", description: "可选：工作流 run id，省略则为最近一次" } } } } },
+  { type: "function", function: { name: "get_build_logs", description: "获取某个工作流的运行日志文本，用于排查失败原因。默认 deploy.yml；用 workflow 指定 clone-repo.yml、unzip.yml、update-cf.yml 等；runId 省略则取该工作流最近一次运行。", parameters: { type: "object", properties: { runId: { type: "string", description: "可选：工作流 run id，省略则为该工作流最近一次" }, workflow: { type: "string", description: "可选：工作流文件名，如 deploy.yml / clone-repo.yml / unzip.yml，省略为 deploy.yml" } } } } },
+  { type: "function", function: { name: "sleep", description: "等待指定秒数后再继续（适合触发工作流后等它跑一会儿，再查询状态或日志）。seconds：1-60。", parameters: { type: "object", properties: { seconds: { type: "number", description: "等待秒数（1-60）" } }, required: ["seconds"] } } },
   { type: "function", function: { name: "list_workflows", description: "列出博客仓库中所有可用的 GitHub 工作流（名称、文件名、状态）。运行指定工作流前可先调用它确认文件名。", parameters: { type: "object", properties: {} } } },
   { type: "function", function: { name: "workflow_runs", description: "查询工作流的运行记录（默认查全部，可传 workflow 指定某个工作流的文件名，如 deploy.yml、clone-repo.yml），用于了解当前是否有工作流在运行及最近结果。", parameters: { type: "object", properties: { workflow: { type: "string", description: "可选：工作流文件名，省略则查全部工作流" } } } } },
   { type: "function", function: { name: "trigger_workflow", description: "触发运行指定的 GitHub 工作流。workflow_id 传工作流文件名（如 clone-repo.yml、deploy.yml）或工作流名称；可用 inputs 传 workflow_dispatch 的输入参数。", parameters: { type: "object", properties: { workflow_id: { type: "string", description: "工作流文件名（如 clone-repo.yml）或名称" }, ref: { type: "string", description: "可选：分支，默认当前分支" }, inputs: { type: "object", description: "可选：workflow_dispatch 输入参数键值对" } }, required: ["workflow_id"] } } },
@@ -1067,9 +1068,10 @@ async function aiToolsHint(db: D1Database): Promise<string> {
     "发邮件：用 send_email 发单封（to）或 broadcast=true 群发给已确认订阅者；需先在设置里配置 SMTP。发送前可先用 get_settings 确认 smtp.host 与 hasPass。",
     "联网：用 http_get 抓取网页或调用 GET 类接口，用 http_post 提交数据或调用写入类接口（需 http(s):// 开头，可自定义 headers/contentType）。响应体会自动截断，超长内容请分页或改用接口的查询参数。",
     "下载与解压：用 download_file 把网络上的文件（含 GitHub 仓库 owner/repo 源码 zip）保存进仓库；用 unzip_file 解压仓库里的 zip（<50MB 即时完成，>50MB 触发 GitHub 工作流异步解压，可用 unzip_status 查看进度）。",
-    "部署排错：用 build_status 查看部署状态；用 get_build_logs 拉取部署工作流日志文本（可传 runId，省略则取最近一次），用于分析构建失败原因。",
+    "部署排错：用 build_status 查看部署状态；用 get_build_logs 拉取日志文本排查失败原因，workflow 可指定 deploy.yml / clone-repo.yml / unzip.yml / update-cf.yml（省略为 deploy.yml），runId 省略则取该工作流最近一次。日志 zip 需要运行结束后才可取；若提示「日志尚不可用」，先 sleep 几秒再试，或先 workflow_runs 确认该次运行已结束。",
+    "等待：用 sleep 等待 seconds 秒（1-60）；触发一个工作流后通常需要等待几秒到几十秒，用 sleep 等待后再 workflow_runs / get_build_logs 查询进度与结果。",
     "工作流控制：用 list_workflows 查看仓库里有哪些工作流；用 workflow_runs 查看运行记录（可传 workflow 文件名）；用 trigger_workflow 运行指定的工作流（workflow_id 传文件名如 deploy.yml，可带 inputs）；用 cancel_workflow 停止当前正在运行的工作流（可传 runId，省略则取消最近一次运行中的）。",
-    "克隆仓库：用 clone_repo 把外部仓库（如一个 Hexo 主题）克隆到当前仓库的指定目录，例如 repo_url=theme-next/hexo-theme-next, target_dir=themes/next；由 GitHub 工作流异步完成。",
+    "克隆仓库：把外部仓库/主题放进仓库优先用 clone_repo（例如 repo_url=theme-next/hexo-theme-next, target_dir=themes/next），由 GitHub 工作流异步完成（约 10-30 秒，可用 sleep 后 workflow_runs/get_build_logs 跟踪）。注意：目标目录必须不存在或为空，否则工作流会中止；若目录已存在，先删除或换个目录名。不要把整仓源码 zip 用 download_file+unzip_file 代替 clone（zip 解压出来会多一层目录，且主题一般不需要）。",
     "文件管理增强：用 move_path 移动或重命名文件/目录（目录整体一次提交）；用 create_folder 新建文件夹（自带 .gitkeep 占位）；用 search_files 按文件名或内容搜索仓库（content=true 搜内容）。",
     "部署排错增强：用 compare_branches 对比两个分支的差异（提交与变更文件）；用 repo_config 一次读取关键配置文件（_config.yml、wrangler.toml 等）并列出所有工作流文件。",
     "Cloudflare 运维：用 cloudflare_api 调用 Cloudflare API v4（需先在「设置 → AI 密钥」保存 CF_API_TOKEN），管理 Worker 路由、DNS 记录、绑定域名等，例如先 path=/zones 或 /accounts 获取 id。",
@@ -1322,7 +1324,7 @@ async function aiRunTool(env: Bindings, name: string, args: Record<string, unkno
     case "build_status":
       return jr(await handleBuildStatus(env));
     case "get_build_logs": {
-      const r = await handleBuildLog(env, s("runId"));
+      const r = await handleBuildLog(env, s("runId"), s("workflow"));
       const d = (await r.json().catch(() => ({}))) as { text?: unknown };
       if (d && typeof d.text === "string" && d.text.length > 30000)
         d.text = d.text.slice(-30000) + "\n...(为节省上下文，日志已截断)";
@@ -1473,6 +1475,11 @@ async function aiRunTool(env: Bindings, name: string, args: Record<string, unkno
       return jr(await handleTriggerWorkflow(env, { workflow_id: s("workflow_id"), ref: s("ref"), inputs: args.inputs }));
     case "cancel_workflow":
       return jr(await handleCancelWorkflow(env, { run_id: s("runId") }));
+    case "sleep": {
+      const sec = Math.min(Math.max(Math.round(Number(s("seconds")) || 1), 1), 60);
+      await new Promise((r) => setTimeout(r, sec * 1000));
+      return JSON.stringify({ ok: true, waited: sec });
+    }
     case "clone_repo":
       return jr(
         await handleCloneRepo(env, {
@@ -2971,23 +2978,40 @@ async function handleBuildHistory(env: Bindings): Promise<Response> {
 
 // 部署工作流日志（Cloudflare 代理）：获取 GitHub Actions 运行日志 zip，解压为纯文本返回。
 // GitHub 的 /actions/runs/{id}/logs 会 302 到签名地址（zip），fetch 自动跟随；用 fflate 解压。
-async function handleBuildLog(env: Bindings, runId: string): Promise<Response> {
+async function handleBuildLog(env: Bindings, runId: string, workflow?: string): Promise<Response> {
   const { token, repo, headers } = ghConfig(env);
   if (!token) return json({ ok: false, error: "GH_TOKEN not configured" }, 500);
+  const wf = String(workflow || "").trim() || "deploy.yml";
   try {
     let id = String(runId || "").trim();
+    let runStatus = "";
     if (!id) {
       const lr = await fetch(
-        `https://api.github.com/repos/${repo}/actions/workflows/deploy.yml/runs?per_page=1`,
+        `https://api.github.com/repos/${repo}/actions/workflows/${encodeURIComponent(wf)}/runs?per_page=1`,
         { headers },
       );
+      if (lr.status === 404) return json({ ok: false, error: `找不到工作流 ${wf}` }, 404);
       if (!lr.ok) return json({ ok: false, error: "github error " + lr.status }, 502);
       const ld = (await lr.json()) as any;
-      id = String(ld.workflow_runs?.[0]?.id || "");
-      if (!id) return json({ ok: false, error: "没有可用的工作流运行记录" }, 404);
+      const latest = ld.workflow_runs?.[0];
+      id = String(latest?.id || "");
+      runStatus = String(latest?.status || "");
+      if (!id) return json({ ok: false, error: `工作流 ${wf} 还没有运行记录` }, 404);
     }
     const res = await fetch(`https://api.github.com/repos/${repo}/actions/runs/${id}/logs`, { headers });
     if (!res.ok) {
+      // 运行尚未结束时 GitHub 不提供日志（返回 404）
+      if (res.status === 404 || res.status === 410) {
+        return json(
+          {
+            ok: false,
+            id,
+            status: runStatus || "in_progress",
+            error: "日志尚不可用：该次运行可能仍在进行中（日志需运行结束后才生成）。请 sleep 几秒后再试，或先用 workflow_runs 确认它已结束。",
+          },
+          409,
+        );
+      }
       const detail = await res.text().catch(() => "");
       return json({ ok: false, error: "获取日志失败 github error " + res.status, detail: detail.slice(0, 300) }, 502);
     }

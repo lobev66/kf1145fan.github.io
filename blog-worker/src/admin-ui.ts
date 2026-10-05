@@ -13,17 +13,16 @@ const VDIRTOR_JS = "https://cdn.jsdelivr.net/npm/vditor@3.11.1/dist/index.min.js
 // AI 消息 Markdown 渲染：使用完整的 GFM 解析器（支持表格、任务列表、删除线等），并用 DOMPurify 防 XSS
 const MARKED_JS = "https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js";
 const DOMPURIFY_JS = "https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js";
-// 文件编辑器语法高亮：CodeMirror 5（MIT，按需懒加载，不拖慢其它页面）
-const CM_BASE = "https://cdn.jsdelivr.net/npm/codemirror@5.65.16";
-const CM_CSS = CM_BASE + "/lib/codemirror.min.css";
-const CM_THEME_DARK = CM_BASE + "/theme/material-darker.min.css";
-const CM_JS = CM_BASE + "/lib/codemirror.min.js";
-const CM_MODES = ["javascript", "css", "xml", "markdown", "python", "shell", "yaml", "sql", "clike", "go"].map(
-  (m) => CM_BASE + "/mode/" + m + "/" + m + ".min.js",
-);
+// 文件编辑器语法高亮：ACE 1.43.3（MIT，按需懒加载，不拖慢其它页面；支持行号/高亮/自动补全/按文件名识别语言）
+// 依次尝试多个 CDN，任一可用即可；全部失败时回退到纯文本编辑器，保证一定能打开
+const ACE_BASES = [
+  "https://cdnjs.cloudflare.com/ajax/libs/ace/1.43.3",
+  "https://cdn.jsdelivr.net/npm/ace-builds@1.43.3/src-min-noconflict",
+];
+const ACE_EXTS = ["ext-language_tools.js", "ext-modelist.js"];
 
 const STYLE = `
-:root{color-scheme:light dark;--accent:#f97316;--accent-h:#ea580c;
+:root{color-scheme:light dark;--accent:#f97316;--accent-h:#ea580c;--accent-rgb:249,115,22;
 --bg:#f7f7f8;--card:#fff;--fg:#1f2328;--muted:#6b7280;--border:#e3e3e4;--nav:#16181d;
 --nav-fg:#e5e7eb;--nav-active:#ffffff;--hover:#f0f0f1;--input-bg:#fff;--danger:#dc2626}
 @media(prefers-color-scheme:dark){:root{
@@ -80,7 +79,7 @@ a{color:var(--accent);text-decoration:none}
 /* 表单 */
 .wk-label{font-size:12px;color:var(--muted);margin:8px 0 4px;display:block}
 .wk-input{width:100%;border:1px solid var(--border);border-radius:3px;padding:6px 10px;font-size:13px;font-family:inherit;outline:none;background:var(--input-bg);color:var(--fg)}
-.wk-input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(249,115,22,.12)}
+.wk-input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(var(--accent-rgb),.12)}
 .wk-row{display:flex;gap:12px}
 @media(max-width:640px){.wk-row{flex-direction:column;gap:0}.wk-row>.wk-field{flex-basis:auto;width:100%}}
 .wk-row>.wk-field{flex:1}
@@ -101,7 +100,7 @@ a{color:var(--accent);text-decoration:none}
 .wk-list li:last-child{border-bottom:none}
 .wk-list .name{font-size:13px;font-weight:500}
 .wk-list .meta{font-size:11px;color:var(--muted);margin-top:1px}
-.wk-list .chip{display:inline-block;font-size:11px;color:var(--accent);background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.25);border-radius:3px;padding:1px 7px;margin-top:4px;margin-right:6px}
+.wk-list .chip{display:inline-block;font-size:11px;color:var(--accent);background:rgba(var(--accent-rgb),.1);border:1px solid rgba(var(--accent-rgb),.25);border-radius:3px;padding:1px 7px;margin-top:4px;margin-right:6px}
 .wk-list .chipTag{color:var(--muted);background:var(--hover);border-color:var(--border)}
 .wk-list .ops{display:flex;gap:6px;flex-shrink:0}
 /* 评论条目 */
@@ -320,9 +319,10 @@ a{color:var(--accent);text-decoration:none}
 #aiChatModel{max-width:34vw!important}
 .ai-input{padding:6px 10px calc(6px + env(safe-area-inset-bottom))}
 }
-/* 文件编辑器：CodeMirror 填满剩余高度，跟随主题 */
-#fileEditor .CodeMirror{flex:1;height:auto;min-height:0;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-#fileEditor .CodeMirror-scroll{padding:6px 0}
+/* 文件编辑器：容器填满剩余高度（ACE 挂载于此，未加载好时先用原生 textarea 兜底） */
+#fileEditArea{flex:1;min-height:0;position:relative;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+#fileEditArea textarea.fileedit-fallback{position:absolute;inset:0;width:100%;height:100%;box-sizing:border-box;border:none;border-radius:0;padding:14px;background:var(--input-bg);color:var(--fg);outline:none;resize:none;font:inherit}
+#fileEditArea .ace_editor{font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 /* 按钮加载中的小转圈 */
 .wk-spin{display:inline-block;width:11px;height:11px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:wk-spin .7s linear infinite;vertical-align:-1px;margin-right:4px}
 @keyframes wk-spin{to{transform:rotate(360deg)}}
@@ -1431,6 +1431,16 @@ function aiNearBottom(box){
 }
 // 贴底意图：用户手动上滑阅读时置 false（不再被强制拉到底部），回到底部附近自动恢复 true
 let aiStick = true;
+// 程序化贴底期间置 true：避免把「自己滚动产生的 scroll 事件」误判成用户上滑而中断贴底
+let aiPinGuard = false;
+// 直接把聊天容器拉到底部（带保护标记，滚动事件里会忽略这次自动滚动）
+function aiPinBottom(box){
+  if(!box) return;
+  aiPinGuard = true;
+  try{ box.scrollTop = box.scrollHeight; }catch(e){}
+  clearTimeout(aiPinBottom._g);
+  aiPinBottom._g = setTimeout(function(){ aiPinGuard = false; }, 80);
+}
 // 滚到聊天底部。消息渲染（Markdown/代码块/图片/折叠）可能在设置后继续改变内容高度，
 // 导致停在半路、需要手动下滑；这里用「多帧 + 定时兜底」把这些延迟的高度变化也滚到底。
 // 但用户主动上滑查看上面内容时不再强制贴底（AI 生成过程中同样适用）。
@@ -1439,7 +1449,7 @@ function scrollAiBottom(){
   aiEnsureColObserver();
   if(!aiStick) return;
   // 每次贴底前都重新判断：用户中途上滑后，后续的延时贴底不再生效
-  const pin = function(){ if(!aiStick) return; try{ box.scrollTop = box.scrollHeight; }catch(e){} };
+  const pin = function(){ if(!aiStick) return; aiPinBottom(box); };
   pin();
   requestAnimationFrame(function(){ pin(); requestAnimationFrame(pin); });
   clearTimeout(scrollAiBottom._t1); clearTimeout(scrollAiBottom._t2); clearTimeout(scrollAiBottom._t3);
@@ -1455,12 +1465,15 @@ function aiEnsureColObserver(){
   if(!aiScrollBound){
     aiScrollBound = true;
     // 用户滚动后按「是否在底部附近」更新贴底意图：上滑看历史就不再被拽回底部
-    box.addEventListener('scroll', function(){ aiStick = aiNearBottom(box); });
+    box.addEventListener('scroll', function(){
+      if(aiPinGuard) return; // 忽略自动贴底产生的滚动
+      aiStick = aiNearBottom(box);
+    });
   }
   if(aiColObserver) return;
   try{
     aiColObserver = new ResizeObserver(function(){
-      if(aiStick) box.scrollTop = box.scrollHeight;
+      if(aiStick) aiPinBottom(box);
     });
     aiColObserver.observe(col);
   }catch(e){}
@@ -2836,68 +2849,129 @@ async function onFileListClick(e){
   filePath=li.dataset.path;
   loadFiles();
 }
-// ---------- 文件编辑器：CodeMirror 懒加载 + 语法高亮 ----------
-let cmReady=false, cmWaiters=[], fileEditorCM=null;
-// 首次打开编辑器时按需加载 CodeMirror（含主题与常用语言模式），不加载就不影响其它页面
-function cmEnsure(cb){
-  if(cmReady){ cb(); return; }
-  cmWaiters.push(cb);
-  if(cmWaiters.length>1) return; // 已在加载中，排队等待
-  [CM_CSS, CM_THEME_DARK].forEach(function(u){
-    const l=document.createElement('link'); l.rel='stylesheet'; l.href=u; document.head.appendChild(l);
-  });
-  const urls=[CM_JS].concat(CM_MODES);
-  let i=0;
-  const next=function(){
-    if(i>=urls.length){ cmReady=true; const ws=cmWaiters; cmWaiters=[]; ws.forEach(function(f){ try{ f(); }catch(e){} }); return; }
-    const sc=document.createElement('script'); sc.src=urls[i++]; sc.onload=next; sc.onerror=next; document.head.appendChild(sc);
+// ---------- 文件编辑器：ACE 懒加载 + 语法高亮 / 自动补全 ----------
+let aceReady=false, aceLoading=false, aceWaiters=[], aceEditor=null;
+// 首次打开编辑器时按需加载 ACE（含补全与按文件名识别语言），不加载就不影响其它页面
+// 逐个 CDN 尝试：主库 ace.js 成功后再加载扩展；某个 CDN 全部失败则换下一个；都失败则保留 textarea 兜底
+function aceEnsure(cb){
+  if(aceReady){ cb(); return; }
+  aceWaiters.push(cb);
+  if(aceLoading) return; // 已在加载中，排队等待
+  aceLoading=true;
+  let bi=0;
+  const finish=function(base){
+    try{ window.ace.config.set('basePath', base); }catch(e){}
+    aceReady=true; aceLoading=false;
+    const ws=aceWaiters; aceWaiters=[];
+    ws.forEach(function(f){ try{ f(); }catch(e){} });
   };
-  next();
+  const loadOne=function(src, ok, fail){
+    const sc=document.createElement('script'); sc.src=src;
+    sc.onload=function(){ ok(); }; sc.onerror=function(){ fail(); };
+    document.head.appendChild(sc);
+  };
+  const tryBase=function(){
+    if(bi>=ACE_BASES.length){ aceLoading=false; aceWaiters=[]; return; } // 全部失败：保留纯文本兜底
+    const base=ACE_BASES[bi++];
+    loadOne(base+'/ace.js', function(){
+      let k=0;
+      const nx=function(){
+        if(k>=ACE_EXTS.length){ finish(base); return; }
+        loadOne(base+'/'+ACE_EXTS[k++], nx, nx); // 扩展失败不影响基本高亮
+      };
+      nx();
+    }, tryBase);
+  };
+  tryBase();
 }
-// 扩展名 -> CodeMirror MIME（未命中则纯文本，不报错）
-function cmModeFor(path){
-  const ext=String(path||'').split('.').pop().toLowerCase();
-  const map={
-    js:'javascript',mjs:'javascript',cjs:'javascript',jsx:'javascript',ts:'javascript',tsx:'javascript',json:'application/json',
-    css:'text/css',scss:'text/x-scss',less:'text/x-less',
-    html:'text/html',htm:'text/html',xml:'application/xml',svg:'application/xml',vue:'text/html',
-    md:'text/x-markdown',markdown:'text/x-markdown',
-    py:'text/x-python',sh:'text/x-sh',bash:'text/x-sh',yml:'text/x-yaml',yaml:'text/x-yaml',
-    sql:'text/x-sql',c:'text/x-csrc',h:'text/x-csrc',cpp:'text/x-c++src',cc:'text/x-c++src',java:'text/x-java',
-    go:'text/x-go'
-  };
-  return map[ext]||null;
+// 读取/写入编辑器文本（ACE 未就绪时用原生 textarea 兜底，保证一定能编辑）
+function fileEditGet(){
+  if(aceEditor) return aceEditor.getValue();
+  const t=document.querySelector('#fileEditArea textarea.fileedit-fallback');
+  return t?t.value:'';
+}
+function fileEditSet(text){
+  const box=$('#fileEditArea'); if(!box) return;
+  if(aceEditor){ aceEditor.setValue(text||'', -1); return; }
+  let t=box.querySelector('textarea.fileedit-fallback');
+  if(!t){ t=document.createElement('textarea'); t.className='fileedit-fallback'; t.spellcheck=false; box.appendChild(t); }
+  t.value=text||'';
 }
 function openFileEditor(path, content){
   fileEditPath=path;
   const pt=$('#fileEditPath'); if(pt) pt.textContent=path;
-  const ta=$('#fileEditArea');
   // 先用纯文本立即打开，不等待 CDN：避免「打不开」或长时间白屏
-  if(fileEditorCM) fileEditorCM.setValue(content||'');
-  else if(ta) ta.value=content||'';
+  fileEditSet(content||'');
   $('#fileEditor').classList.remove('hidden');
-  applyCodeMirror();
+  applyAce();
   // 高亮在后台按需加载，加载完成后自动把已打开的编辑器升级为高亮编辑器
-  cmEnsure(function(){ applyCodeMirror(); });
+  aceEnsure(function(){ applyAce(); });
 }
-// CodeMirror 已就绪时：把当前编辑器切换为该文件类型的高亮模式（未就绪则保持纯文本）
-function applyCodeMirror(){
-  const ta=$('#fileEditArea');
-  if(!window.CodeMirror || !ta) return;
-  const dark=!!(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches);
-  const mode=cmModeFor(fileEditPath);
-  if(!fileEditorCM){
-    fileEditorCM=window.CodeMirror.fromTextArea(ta,{
-      mode:mode||null, lineNumbers:true, lineWrapping:true, indentUnit:2, tabSize:2,
-      theme:dark?'material-darker':'default'
+// ACE 字体/主题跟随系统深浅色
+function aceThemeName(){
+  return (window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'ace/theme/tomorrow_night' : 'ace/theme/textmate';
+}
+// ACE 就绪时：初始化/切换语言模式、主题与自动补全（未就绪则保持纯文本兜底）
+function applyAce(){
+  const box=$('#fileEditArea');
+  if(!window.ace || !box) return;
+  if(!aceEditor){
+    const t=box.querySelector('textarea.fileedit-fallback');
+    const text=t?t.value:'';
+    if(t) t.remove();
+    aceEditor=window.ace.edit(box);
+    aceEditor.session.setUseWrapMode(true);
+    aceEditor.session.setTabSize(2);
+    aceEditor.session.setUseSoftTabs(true);
+    aceEditor.setOptions({
+      showPrintMargin:false, fontSize:'13px',
+      enableBasicAutocompletion:true, enableLiveAutocompletion:true, enableSnippets:true,
     });
-  } else {
-    fileEditorCM.setOption('mode', mode||null);
+    try{ aceEditor.setValue(text, -1); }catch(e){ try{ aceEditor.setValue(text||'', -1); }catch(e2){} }
   }
-  setTimeout(function(){ try{ fileEditorCM.refresh(); }catch(e){} },60);
+  applyAceMode(aceEditor, fileEditPath);
+  try{ aceEditor.setTheme(aceThemeName()); }catch(e){}
+  setTimeout(function(){ try{ aceEditor.resize(); }catch(e){} }, 60);
+}
+function applyAceMode(ed, path){
+  let mode='ace/mode/text';
+  try{
+    const modelist=window.ace.require('ace/ext/modelist');
+    if(modelist && modelist.getModeForPath){
+      const m=modelist.getModeForPath(String(path||''));
+      if(m && m.mode) mode=m.mode;
+    }
+  }catch(e){}
+  try{ ed.session.setMode(mode); }catch(e){}
+}
+// 主题色改变后，编辑器主题也随之更新
+function refreshAceTheme(){ if(aceEditor){ try{ aceEditor.setTheme(aceThemeName()); }catch(e){} } }
+// ---------- 后台主题色（仅本机浏览器，localStorage 记住） ----------
+function shadeHex(hex, amt){
+  const n=parseInt(hex.slice(1),16);
+  const f=function(v){ const x=Math.round(v+(amt<0?v*amt:(255-v)*amt)); return Math.max(0,Math.min(255,x)); };
+  return '#'+[f((n>>16)&255),f((n>>8)&255),f(n&255)].map(function(v){ return v.toString(16).padStart(2,'0'); }).join('');
+}
+function applyAccent(hex){
+  hex=String(hex||'').trim();
+  if(!/^#[0-9a-fA-F]{6}$/.test(hex)) hex='#f97316';
+  const n=parseInt(hex.slice(1),16);
+  const rgb=((n>>16)&255)+','+((n>>8)&255)+','+(n&255);
+  const root=document.documentElement;
+  root.style.setProperty('--accent',hex);
+  root.style.setProperty('--accent-h',shadeHex(hex,-0.12));
+  root.style.setProperty('--accent-rgb',rgb);
+  try{ localStorage.setItem('admin_accent',hex); }catch(e){}
+  const sel=$('#setAccent'); if(sel) sel.value=hex;
+  refreshAceTheme();
+}
+function initAccent(){
+  let v='';
+  try{ v=localStorage.getItem('admin_accent')||''; }catch(e){}
+  applyAccent(v||'#f97316');
 }
 async function saveFileEdit(){
-  const content = fileEditorCM ? fileEditorCM.getValue() : $('#fileEditArea').value;
+  const content = fileEditGet();
   opBanner('正在保存文件…','busy');
   const r=await api(API_BASE+'/file',{method:'PUT',body:JSON.stringify({path:fileEditPath,content,branch:curBranch()})});
   if(r.status===401){ redirectLogin(); return; }
@@ -3079,6 +3153,7 @@ function restoreDraft(){
 // ---------- init ----------
 function redirectLogin(){ location.replace('/admin/login'); }
 document.addEventListener('DOMContentLoaded', ()=>{
+  initAccent(); // 恢复上次选择的主题色（仅本机浏览器）
   token = getToken();
   if(!token){ redirectLogin(); return; }
   // 记录 URL 中的会话 id（/admin/ai/<id>），供进入 AI 页时自动打开
@@ -3355,7 +3430,7 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
           <button class="logout" id="fileEditSave" style="color:#fff;background:var(--accent);border:none;padding:4px 14px;border-radius:3px;cursor:pointer">保存</button>
         </div>
       </div>
-      <textarea id="fileEditArea" style="flex:1;width:100%;font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;border:none;border-radius:0;padding:14px;background:var(--input-bg);color:var(--fg);outline:none;resize:none"></textarea>
+      <div id="fileEditArea"></div>
     </div>
   </div>
 
@@ -3514,6 +3589,27 @@ export function renderAdminPage(siteUrl: string, ghRepo?: string, initial = "man
 
   <!-- 设置（各分区可展开/收起：SMTP、站点功能、订阅设置、API 说明） -->
   <div id="page-settings" class="${pageCls("settings")}">
+    <details class="wk-collapse">
+      <summary>外观 · 主题色</summary>
+      <div class="wk-collapse-body">
+        <p class="wk-label" style="margin-top:0">切换后台的主题/强调色（按钮、选中态、图表、编辑器等），选择后立即生效并记住；仅作用于你这台设备的浏览器，不影响访客。</p>
+        <div class="filters" style="margin:0 0 4px">
+          <span class="wk-label" style="margin:0">主题色</span>
+          <select class="wk-input" id="setAccent" onchange="applyAccent(this.value)" style="width:auto;min-width:150px;padding:4px 8px">
+            <option value="#f97316">橙色（默认）</option>
+            <option value="#3b82f6">蓝色</option>
+            <option value="#10b981">绿色</option>
+            <option value="#8b5cf6">紫色</option>
+            <option value="#ec4899">粉色</option>
+            <option value="#ef4444">红色</option>
+            <option value="#14b8a6">青色</option>
+            <option value="#eab308">金色</option>
+            <option value="#64748b">石板灰</option>
+          </select>
+        </div>
+      </div>
+    </details>
+
     <details class="wk-collapse">
       <summary>SMTP 邮件服务器</summary>
       <div class="wk-collapse-body">
